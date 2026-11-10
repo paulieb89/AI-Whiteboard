@@ -945,6 +945,8 @@
       if (e.key === 'f') toggleFull();
       else if (e.key === 'r') replay();
       else if (e.key === 'h') document.body.classList.toggle('present');
+      else if (/^[1-4]$/.test(e.key)) document.querySelectorAll('#tray .marker')[Number(e.key) - 1]?.click();
+      else if (e.key === 'e') document.querySelector('#tray .eraser')?.click();
     }
   });
   // Catch up instantly when nobody can see the animation, so the board is
