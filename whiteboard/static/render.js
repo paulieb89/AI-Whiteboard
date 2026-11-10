@@ -838,6 +838,29 @@
   }
   for (const k of ['rect', 'ellipse', 'circle', 'diamond', 'triangle', 'hexagon', 'star', 'cloud', 'cylinder', 'parallelogram']) COMPILERS[k] = compileShape;
 
+  // ---- buttons the user can click (wait_for_choice)
+  COMPILERS.button = function (el, c) {
+    const size = num(el.size, 28);
+    const col = c.C(el.color, 'blue');
+    const pad = size * 1.1;
+    const lay = layoutText(el.text, { size, family: el.font, bold: true, maxWidth: el.w ? Math.max(30, num(el.w, 0) - pad * 2) : 520 });
+    const x = num(el.x, 0), y = num(el.y, 0);
+    const w = num(el.w, lay.width + pad * 2), h = num(el.h, lay.height + size * 0.9);
+    const lw = el.chosen ? 4 : 3;
+    const poly = roundRectPts(x, y, w, h, Math.min(h / 2, size * 0.7));
+    const ops = [F(shift(poly, 3, 5), col, { alpha: el.chosen ? 0.18 : 0.3 })];
+    if (el.chosen) ops.push(F(poly, col, { alpha: 0.95 }));
+    else ops.push(F(poly, c.theme.surface, { alpha: 1 }), F(poly, col, { alpha: 0.1 }));
+    ops.push(S(roughPoly(c.r, poly, true, c.R * 0.5), col, lw));
+    const cy = y + h / 2;
+    if (el.chosen) {
+      const tx = x + size * 0.36;
+      ops.push(S(roughPoly(c.r, [[tx, cy], [tx + size * 0.18, cy + size * 0.2], [tx + size * 0.48, cy - size * 0.26]], false, c.R * 0.4), '#ffffff', Math.max(3, size * 0.13), { alpha: 1 }));
+    }
+    ops.push(textOp(c, lay, x + w / 2 + (el.chosen ? size * 0.2 : 0), cy - lay.height / 2, 'center', el.chosen ? '#ffffff' : col));
+    return { ops, bbox: [x - lw / 2, y - lw / 2, w + lw + 3, h + lw + 5] };
+  };
+
   // ---- lines & arrows
   function headOps(c, pts, which, col, w, size, filled) {
     const ops = [];

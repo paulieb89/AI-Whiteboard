@@ -80,6 +80,9 @@ running, and opens the board in your browser the first time something is drawn
 | `look` | Returns a picture of the board, so the AI sees what you see |
 | `get_board` | Ids, labels and bounding boxes of everything, plus a map of free space |
 | `update` | Move (`x`/`y` or `dx`/`dy`), restyle or re-word elements |
+| `arrange` | Line elements up and space them evenly in one call (the fix for overlap warnings) |
+| `reorder` | Bring elements to the front or send them to the back |
+| `wait_for_choice` | Ask you something: the AI draws `button` elements and gets the one you click |
 | `erase` / `clear_board` / `undo` | Remove things (with an eraser animation) |
 | `say` | The mascot says something in a speech bubble (optional `pause` holds the drawing) |
 | `pause` | Hold the drawing for a few seconds, to pace a presentation |
@@ -96,7 +99,7 @@ curl -X POST http://127.0.0.1:8765/api/draw -H "Content-Type: application/json" 
 ```
 
 `GET /api/guide` returns the reference written for AIs. Other endpoints:
-`/api/board`, `/api/update`, `/api/erase`, `/api/clear`, `/api/undo`,
+`/api/board`, `/api/update`, `/api/arrange`, `/api/order`, `/api/choice` (waits for a button click), `/api/erase`, `/api/clear`, `/api/undo`,
 `/api/say`, `/api/pause`, `/api/point`, `/api/settings`, `/api/save`,
 `/api/load`, and `/api/snapshot?format=png|jpeg&width=1600` (needs the board
 open in a browser). Send an `X-Agent: <name>` header and the board shows
@@ -123,6 +126,9 @@ python -m whiteboard run my_board.json     # a list of elements and ops
 python -m whiteboard board                 # what's on the board + free-space map
 python -m whiteboard look board.png
 python -m whiteboard say "Done!"
+python -m whiteboard arrange a b c --align top --distribute horizontal --gap 40
+python -m whiteboard order back frame1     # or: order front ID...
+python -m whiteboard wait --timeout 120    # prints the button the user clicks
 python -m whiteboard erase rect1 | clear | undo | stop
 ```
 
