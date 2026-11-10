@@ -13,7 +13,6 @@ import copy
 import json
 import re
 import threading
-import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -24,7 +23,7 @@ ELEMENT_TYPES = (
     "text", "title", "rect", "ellipse", "circle", "diamond", "triangle", "hexagon",
     "star", "cloud", "cylinder", "parallelogram", "line", "arrow", "path", "highlight",
     "emoji", "icon", "image", "sticky", "panel", "bubble", "banner", "table", "chart",
-    "code", "frame", "timeline", "mindmap", "flow",
+    "code", "frame", "timeline", "mindmap", "flow", "button",
 )
 
 SHAPE_TYPES = (
@@ -66,6 +65,9 @@ ALIASES: Dict[str, Tuple[str, Dict[str, Any]]] = {
     "mind_map": ("mindmap", {}),
     "picture": ("image", {}),
     "photo": ("image", {}),
+    "choice": ("button", {}),
+    "option": ("button", {}),
+    "btn": ("button", {}),
     "marker": ("highlight", {}),
     "highlighter": ("highlight", {}),
 }
@@ -84,6 +86,9 @@ ID_RE = re.compile(r"^[A-Za-z0-9_\-:.]{1,64}$")
 # Average glyph width as a fraction of the font size (Kalam, the default hand font)
 GLYPH_W = 0.47
 MASCOT_ZONE = (1400, 770, 200, 230)
+
+ALIGNMENTS = ("left", "center", "right", "top", "middle", "bottom")
+DISTRIBUTIONS = ("horizontal", "vertical")
 
 NUMERIC_FIELDS = (
     "x", "y", "w", "h", "cx", "cy", "r", "size", "width", "radius", "curve",
@@ -279,6 +284,10 @@ def estimate_size(el: Dict[str, Any], board: Dict[str, Any]) -> Tuple[float, flo
         w = el.get("w") or max(len(line) for line in lines) * size * 0.6 + size * 2
         h = len(lines) * size * 1.4 + size * 1.6 + (size * 1.8 if el.get("title") else 0)
         return w, h
+    if t == "button":
+        size = size or 28
+        tw, th = text_size(el.get("text"), size, glyph=GLYPH_W * 1.05)
+        return el.get("w") or tw + size * 2.2, el.get("h") or th + size * 0.9
     if t == "timeline":
         size = size or 22
         return el.get("w") or 1000, size * 8
@@ -425,6 +434,15 @@ class BoardState:
             raise BoardError("icon needs 'name'")
         if kind == "image" and not isinstance(el.get("src"), str):
             raise BoardError("image needs 'src' (an http(s) URL or data: URI)")
+        if kind == "button":
+            if not plain_text(el.get("text")).strip():
+                raise BoardError("button needs 'text'")
+            if el.get("chosen"):
+                el["chosen"] = True
+            else:
+                el.pop("chosen", None)
+            if el.get("group") is not None:
+                el["group"] = str(el["group"])[:64]
         if kind == "emoji" and not (el.get("text") or el.get("emoji") or el.get("char")):
             raise BoardError("emoji needs 'text'")
 
@@ -692,6 +710,9 @@ class BoardState:
             el["cy"] = el.get("cy", 0) + dy
         else:
             b = self.bbox_of(el["id"]) if el["id"] in self.elements else None
+            if t == "title" and "x" not in el and b:  # a title's x is its anchor, centred by default
+                align = el.get("align", "center")
+                el["x"] = b[0] + b[2] / 2 if align == "center" else b[0] + b[2] if align == "right" else b[0]
             el["x"] = el.get("x", b[0] if b and t not in ("title",) else 0) + dx
             el["y"] = el.get("y", b[1] if b else 0) + dy
 
@@ -707,6 +728,142 @@ class BoardState:
             self.version += 1
             self.schedule_save()
             return gone
+
+    def choose(self, eid: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Mark a button as the user's pick and unmark the rest of its group.
+
+        Returns (the button, the elements that changed). A click is an answer, not an
+        edit, so it stays out of the undo history.
+        """
+        with self.lock:
+            el = self.elements.get(eid)
+            if not el or el["type"] != "button":
+                raise BoardError(f"{eid!r} is not a button on the board")
+            group = el.get("group")
+            before: Dict[str, Optional[Dict[str, Any]]] = {}
+            for oid, other in self.elements.items():
+                same = oid == eid
+                if other["type"] != "button" or bool(other.get("chosen")) == same:
+                    continue
+                if not same and (group is None or other.get("group") != group):
+                    continue
+                before[oid] = other
+            changed = []
+            for oid, old in before.items():
+                new = copy.deepcopy(old)
+                if oid == eid:
+                    new["chosen"] = True
+                else:
+                    new.pop("chosen", None)
+                changed.append(new)
+            if changed:
+                for new in changed:
+                    self.elements[new["id"]] = new  # same size, so measured bboxes stay valid
+                self.version += 1
+                self.schedule_save()
+            return copy.deepcopy(self.elements[eid]), copy.deepcopy(changed)
+
+    def arrange(self, ids: List[str], align: Optional[str] = None, distribute: Optional[str] = None,
+                gap: Any = None) -> Tuple[List[Dict[str, Any]], List[str]]:
+        """Line elements up and/or space them evenly, as one undo step.
+
+        align: left | center | right (x axis) or top | middle | bottom (y axis), against the
+        box around all the listed elements. distribute: horizontal | vertical; without a gap
+        the outermost edges stay put and the spaces in between are made equal, with a gap
+        the elements are packed from the first one with exactly that space between them.
+        Returns (changed elements, skipped ids). Arrows tied to elements are skipped: they
+        follow whatever they connect.
+        """
+        if align is not None and align not in ALIGNMENTS:
+            raise BoardError(f"align must be one of {', '.join(ALIGNMENTS)}")
+        if distribute is not None and distribute not in DISTRIBUTIONS:
+            raise BoardError(f"distribute must be one of {', '.join(DISTRIBUTIONS)}")
+        if not align and not distribute:
+            raise BoardError("arrange needs 'align' and/or 'distribute'")
+        if gap is not None:
+            gap = _num(gap, "gap")
+            if not distribute:
+                raise BoardError("'gap' only applies with 'distribute'")
+        if isinstance(ids, str):
+            ids = [ids]
+        with self.lock:
+            ids = list(dict.fromkeys(str(i) for i in ids or []))
+            unknown = [i for i in ids if i not in self.elements]
+            if unknown:
+                raise BoardError(f"no element with id {', '.join(repr(i) for i in unknown)}")
+            skipped = [i for i in ids if self.elements[i]["type"] == "arrow" and not (
+                isinstance(self.elements[i]["from"], list) and isinstance(self.elements[i]["to"], list))]
+            movable = [i for i in ids if i not in skipped]
+            if len(movable) < 2:
+                raise BoardError("arrange needs at least two elements to line up")
+            old = {i: list(self.bbox_of(i)) for i in movable}
+            new = {i: list(b) for i, b in old.items()}
+            if align:
+                u = _union(new.values())
+                axis = 0 if align in ("left", "center", "right") else 1
+                frac = {"left": 0, "top": 0, "center": 0.5, "middle": 0.5, "right": 1, "bottom": 1}[align]
+                for b in new.values():
+                    b[axis] = u[axis] + (u[axis + 2] - b[axis + 2]) * frac
+            if distribute:
+                axis = 0 if distribute == "horizontal" else 1
+                order = sorted(movable, key=lambda i: new[i][axis])
+                start = new[order[0]][axis]
+                space = gap
+                if space is None:
+                    if len(order) < 3:
+                        raise BoardError("distribute needs three or more elements, or a 'gap'")
+                    end = max(new[i][axis] + new[i][axis + 2] for i in order)
+                    space = (end - start - sum(new[i][axis + 2] for i in order)) / (len(order) - 1)
+                for i in order:
+                    new[i][axis] = start
+                    start += new[i][axis + 2] + space
+            before: Dict[str, Optional[Dict[str, Any]]] = {}
+            changed: List[Dict[str, Any]] = []
+            for i in movable:
+                dx, dy = round(new[i][0] - old[i][0], 1), round(new[i][1] - old[i][1], 1)
+                if not dx and not dy:
+                    continue
+                prev = self.elements[i]
+                el = copy.deepcopy(prev)
+                self._shift(el, dx, dy)
+                el = self.normalize(el, set())
+                before[i] = prev
+                changed.append(el)
+            if changed:
+                self._record(before)
+                for el in changed:
+                    i = el["id"]
+                    self.elements[i] = el
+                    if i in self.bboxes:  # keep the measured size, at the new position
+                        b = self.bboxes[i]
+                        self.bboxes[i] = [round(b[0] + new[i][0] - old[i][0], 1),
+                                          round(b[1] + new[i][1] - old[i][1], 1), b[2], b[3]]
+                self.version += 1
+                self.schedule_save()
+            return copy.deepcopy(changed), skipped
+
+    def reorder(self, ids: List[str], to: str = "front") -> List[str]:
+        """Move elements to the front (drawn last) or the back. Returns the new stacking order."""
+        if to not in ("front", "back"):
+            raise BoardError("'to' must be \"front\" or \"back\"")
+        if isinstance(ids, str):
+            ids = [ids]
+        with self.lock:
+            picked = {str(i) for i in ids or []}
+            if not picked:
+                raise BoardError("reorder needs at least one element id")
+            unknown = sorted(i for i in picked if i not in self.elements)
+            if unknown:
+                raise BoardError(f"no element with id {', '.join(repr(i) for i in unknown)}")
+            moved = [i for i in self.elements if i in picked]  # keep their relative stacking
+            rest = [i for i in self.elements if i not in picked]
+            order = rest + moved if to == "front" else moved + rest
+            if order != list(self.elements):
+                self._record({})
+                self.elements = {i: self.elements[i] for i in order}
+                self.version += 1
+                self.schedule_save()
+            return order
 
     def ids_in_region(self, region: List[float], author: Optional[str] = None) -> List[str]:
         with self.lock:

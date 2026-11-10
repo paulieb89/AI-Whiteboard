@@ -30,7 +30,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .reference import guide
-from .state import BACKGROUNDS, BoardError, BoardState
+from .state import BACKGROUNDS, BoardError, BoardState, plain_text
 
 STATIC_DIR = Path(__file__).parent / "static"
 DEFAULT_PORT = 8765
@@ -71,6 +71,7 @@ class Hub:
         self.clients_lock = threading.Lock()
         self.cond = threading.Condition()
         self.snapshots: Dict[str, Optional[bytes]] = {}
+        self.choices: List[Dict[str, Any]] = []  # button clicks nobody has collected yet
         self.activity: Dict[str, Any] = {}
         self.started = time.time()
 
@@ -151,12 +152,66 @@ class Hub:
             self.cond.notify_all()
         return True
 
+    # ---- asking the user ----------------------------------------------------
+    def choose(self, eid: Any, agent: Optional[str] = None) -> Dict[str, Any]:
+        """The user clicked a button: mark it and hand the click to whoever is waiting."""
+        el, changed = self.state.choose(str(eid or ""))
+        if changed:
+            self.broadcast({"type": "update", "elements": changed, "agent": agent})
+        text = plain_text(el.get("text")).strip()
+        click = {"id": el["id"], "text": text, "value": el.get("value", text), "at": round(time.time(), 3)}
+        if el.get("group") is not None:
+            click["group"] = el["group"]
+        with self.cond:
+            self.choices.append(click)
+            del self.choices[:-50]
+            self.cond.notify_all()
+        self.broadcast({"type": "choice", **click})
+        return {"ok": True, "chosen": click}
+
+    def wait_for_choice(self, ids: Optional[List[str]] = None, group: Optional[str] = None,
+                        timeout: Any = 60.0) -> Dict[str, Any]:
+        """Block until the user clicks a button (optionally one of `ids` or of `group`).
+
+        A click made before the call still counts. If the user changed their mind and
+        clicked several, the last click wins. Returns chosen: None on timeout.
+        """
+        try:
+            secs = max(0.0, min(float(timeout), 600.0))
+        except (TypeError, ValueError):
+            raise BoardError("timeout must be a number of seconds") from None
+        wanted = {str(i) for i in ids} if ids else None
+
+        def match(c: Dict[str, Any]) -> bool:
+            return (wanted is None or c["id"] in wanted) and (group is None or c.get("group") == str(group))
+
+        deadline = time.time() + secs
+        with self.cond:
+            while True:
+                hits = [c for c in self.choices if match(c)]
+                if hits:
+                    self.choices = [c for c in self.choices if not match(c)]
+                    return {"ok": True, "chosen": hits[-1]}
+                left = deadline - time.time()
+                if left <= 0:
+                    return {"ok": True, "chosen": None, "timed_out": True,
+                            "note": "nobody clicked a button yet; call again to keep waiting"}
+                self.cond.wait(left)
+
+    def _forget_choices(self, ids: Optional[List[str]] = None) -> None:
+        """Drop uncollected clicks on buttons that were erased or redrawn."""
+        with self.cond:
+            self.choices = [c for c in self.choices if c["id"] in self.state.elements
+                            and not (ids and c["id"] in ids)]
+
     # ---- operations shared by the REST API and the MCP server ------------
     def draw(self, elements: Any, author: str = "ai", agent: Optional[str] = None,
              origin: Optional[str] = None, wait: bool = True) -> Dict[str, Any]:
         if isinstance(elements, dict):
             elements = [elements]
         added, replaced = self.state.add(elements, author=author, agent=agent)
+        if replaced:
+            self._forget_choices(replaced)
         self.broadcast({"type": "add", "elements": added, "replaced": replaced,
                         "agent": agent, "origin": origin})
         self._note_activity(agent, f"drew {len(added)} element(s)")
@@ -191,6 +246,7 @@ class Hub:
         unknown = [i for i in targets if i not in self.state.elements]
         gone = self.state.remove(list(dict.fromkeys(targets)))
         if gone:
+            self._forget_choices()
             self.broadcast({"type": "remove", "ids": gone, "agent": agent, "origin": origin})
         self._note_activity(agent, f"erased {len(gone)} element(s)")
         out: Dict[str, Any] = {"ok": True, "erased": gone}
@@ -198,8 +254,35 @@ class Hub:
             out["unknown_ids"] = unknown
         return out
 
+    def arrange(self, ids: Any, align: Optional[str] = None, distribute: Optional[str] = None,
+                gap: Any = None, agent: Optional[str] = None) -> Dict[str, Any]:
+        if not isinstance(ids, list):
+            raise BoardError("arrange needs 'ids' (a list of element ids)")
+        changed, skipped = self.state.arrange(ids, align, distribute, gap)
+        if changed:
+            self.broadcast({"type": "update", "elements": changed, "agent": agent})
+        self._note_activity(agent, f"arranged {len(ids)} element(s)")
+        kept = [str(i) for i in ids if str(i) not in skipped]
+        out = self._result(kept, self.wait_for_layout(kept))
+        out["moved"] = [e["id"] for e in changed]
+        if skipped:
+            out["skipped"] = skipped
+        return out
+
+    def reorder(self, ids: Any, to: str = "front", agent: Optional[str] = None) -> Dict[str, Any]:
+        if isinstance(ids, str):
+            ids = [ids]
+        if not isinstance(ids, list):
+            raise BoardError("reorder needs 'ids' (a list of element ids)")
+        ids = [str(i) for i in ids]
+        order = self.state.reorder(ids, to)
+        self.broadcast({"type": "order", "ids": ids, "to": to, "agent": agent})
+        self._note_activity(agent, f"moved {len(ids)} element(s) to the {to}")
+        return {"ok": True, "to": to, "order": order}
+
     def clear(self, background: Optional[str] = None, agent: Optional[str] = None) -> Dict[str, Any]:
         n = self.state.clear()
+        self._forget_choices()
         if background:
             self.state.set_settings({"background": background})
         self.broadcast({"type": "clear", "settings": self.state.settings, "agent": agent})
@@ -214,6 +297,7 @@ class Hub:
     def undo(self) -> Dict[str, Any]:
         ok = self.state.undo()
         if ok:
+            self._forget_choices()  # the undo may have removed buttons with uncollected clicks
             self.broadcast({"type": "sync", "state": self.state.to_dict()})
         return {"ok": ok, "message": "undone" if ok else "nothing to undo"}
 
@@ -273,6 +357,8 @@ class Hub:
                     before.setdefault(e["id"], None)
             self.state._record(before, settings_before=dict(self.state.settings))
             self.state.load_dict(data)
+        with self.cond:
+            self.choices = []  # a different board: clicks on the old one answer nothing, even if ids match
         self.state.schedule_save()
         self.broadcast({"type": "sync", "state": self.state.to_dict(), "animate": True})
         return {"ok": True, "name": safe, "count": len(self.state.elements)}
@@ -406,6 +492,10 @@ class Handler(BaseHTTPRequestHandler):
                 data = self.hub.request_snapshot(fmt, max(200, min(width, 4000)),
                                                  float(qs.get("timeout", ["8"])[0]))
                 return self._send(200, data, f"image/{fmt}")
+            if path == "/api/choice":
+                ids = [i for i in ",".join(qs.get("ids", [])).split(",") if i]
+                return self._json(200, self.hub.wait_for_choice(
+                    ids or None, qs.get("group", [None])[0], qs.get("timeout", ["60"])[0]))
             if path == "/api/events":
                 return self._events()
             return self._error(404, f"no route {path}")
@@ -444,6 +534,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, hub.erase(body.get("ids"), body.get("region"),
                                                  body.get("author"), agent=agent,
                                                  origin=body.get("origin")))
+            if path == "/api/choose":
+                return self._json(200, hub.choose(body.get("id"), agent=agent))
+            if path == "/api/arrange":
+                return self._json(200, hub.arrange(body.get("ids"), body.get("align"),
+                                                   body.get("distribute"), body.get("gap"), agent=agent))
+            if path == "/api/order":
+                return self._json(200, hub.reorder(body.get("ids", body.get("id")),
+                                                   body.get("to", "front"), agent=agent))
             if path == "/api/clear":
                 bg = body.get("background")
                 if bg and bg not in BACKGROUNDS:

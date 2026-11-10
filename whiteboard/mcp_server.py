@@ -34,7 +34,8 @@ INSTRUCTIONS = (
     "This server controls a live whiteboard the user watches in their browser. Use it to show "
     "things visually: plans, diagrams, explanations, sketches, charts. Draw with `draw` (call "
     "`guide` once for the full element and icon reference), check the result with `look`, fix it "
-    "with `update`/`erase`, and talk to the user through the mascot with `say`. "
+    "with `update`/`erase`, and talk to the user through the mascot with `say`. To ask the user "
+    "something, draw `button` elements and call `wait_for_choice` to get the one they click. "
     "The board is 1600x1000, origin top-left."
 )
 
@@ -117,6 +118,29 @@ class WhiteboardMCP:
         def erase(args):
             return [_text(b.erase(args.get("ids"), args.get("region"), args.get("author")))]
 
+        @self.tool("arrange", "Tidy up in one call: line elements up (align) and/or space them evenly "
+                   "(distribute). Fixes overlap warnings: distribute with a gap puts exactly that much space "
+                   "between the elements. Arrows follow the elements they connect.", {
+            "ids": {"type": "array", "items": {"type": "string"}, "description": "Two or more element ids."},
+            "align": {"type": "string", "enum": ["left", "center", "right", "top", "middle", "bottom"],
+                      "description": "Edge or centre line to share, taken from the box around all the ids."},
+            "distribute": {"type": "string", "enum": ["horizontal", "vertical"],
+                           "description": "Make the spaces between the elements equal along this axis."},
+            "gap": {"type": "number", "description": "With distribute: exact space between neighbours, "
+                    "packed from the first element. Without it the outer edges stay where they are."},
+        }, ["ids"])
+        def arrange(args):
+            return [_text(b.arrange(args.get("ids") or [], args.get("align"), args.get("distribute"),
+                                    args.get("gap")))]
+
+        @self.tool("reorder", "Change stacking: bring elements to the front (on top of everything) or "
+                   "send them to the back (behind everything). Their position does not change.", {
+            "ids": {"type": "array", "items": {"type": "string"}},
+            "to": {"type": "string", "enum": ["front", "back"], "description": "Default front."},
+        }, ["ids"])
+        def reorder(args):
+            return [_text(b.reorder(args.get("ids") or [], args.get("to") or "front"))]
+
         @self.tool("clear_board", "Wipe the whole board (an eraser sweeps across it). Optionally switch "
                    "the background.", {
             "background": {"type": "string", "enum": ["whiteboard", "grid", "dots", "chalkboard", "blueprint"]},
@@ -169,7 +193,25 @@ class WhiteboardMCP:
         def point_at(args):
             return [_text(b.point(args.get("x"), args.get("y"), args.get("id"), args.get("label")))]
 
-        @self.tool("undo", "Undo the last change to the board.", {})
+        @self.tool("wait_for_choice", "Ask the user: first draw a question and a few `button` elements "
+                   "(give them ids and a shared \"group\"), then call this. It waits until the user clicks one "
+                   "and returns its id, text and value. The clicked button is shown as chosen on the board. "
+                   "If nobody clicks in time, chosen is null: call again to keep waiting.", {
+            "ids": {"type": "array", "items": {"type": "string"},
+                    "description": "Only accept these buttons (default: any button)."},
+            "group": {"type": "string", "description": "Only accept buttons of this group."},
+            "timeout": {"type": "number", "description": "Seconds to wait (default 60, max 600)."},
+        })
+        def wait_for_choice(args):
+            b.ensure_server()
+            b.ensure_viewer()
+            timeout = args.get("timeout")
+            return [_text(b.wait_for_choice(args.get("ids"), args.get("group"),
+                                            60 if timeout is None else timeout))]
+
+        @self.tool("undo", "Reverse the last change to the board, including a clear or load. Call again "
+                   "to go further back. It also undoes the user's changes, so prefer erase or update for "
+                   "your own elements.", {})
         def undo(args):
             return [_text(b.undo())]
 

@@ -106,6 +106,12 @@
     if (!board.els.has(el.id)) board.order.push(el.id);
     board.els.set(el.id, el);
   }
+  function moveEls(board, ids, to) {
+    const picked = new Set(ids);
+    const moved = board.order.filter((i) => picked.has(i));
+    const rest = board.order.filter((i) => !picked.has(i));
+    board.order = to === 'back' ? moved.concat(rest) : rest.concat(moved);
+  }
   function dropEl(board, id) {
     if (!board.els.delete(id)) return;
     board.order = board.order.filter((i) => i !== id);
@@ -224,6 +230,10 @@
       }
       case 'update':
         for (const el of it.els) replaceEl(view, el);
+        renderInk();
+        return;
+      case 'order':
+        moveEls(view, it.ids, it.to);
         renderInk();
         return;
       case 'remove': {
@@ -629,6 +639,10 @@
         queue.push({ kind: 'update', els: ev.elements });
         reportLayout(ev.elements.map((e) => e.id));
         break;
+      case 'order':
+        moveEls(model, ev.ids, ev.to);
+        queue.push({ kind: 'order', ids: ev.ids, to: ev.to });
+        break;
       case 'remove':
         ev.ids.forEach((id) => dropEl(model, id));
         queue.push({ kind: 'remove', ids: ev.ids, anim: ev.origin !== clientId });
@@ -721,6 +735,7 @@
   const trayButtons = document.querySelectorAll('#tray .marker, #tray .tool');
   function setTool(t) {
     tool = t;
+    surface.style.cursor = '';
     surface.dataset.tool = t ? t.kind : '';
     trayButtons.forEach((b) => {
       const on = t && ((t.kind === 'pen' && b.dataset.color === t.color) || (t.kind !== 'pen' && b.dataset.tool === t.kind));
@@ -739,12 +754,31 @@
     const r = surface.getBoundingClientRect();
     return [((e.clientX - r.left) / r.width) * view.settings.width, ((e.clientY - r.top) / r.height) * view.settings.height];
   }
+  // Buttons the AI drew: with no marker in hand, a click answers the question.
+  function buttonAt(p) {
+    const env = envFor(view);
+    for (let i = view.order.length - 1; i >= 0; i--) {
+      const el = view.els.get(view.order[i]);
+      if (!el || el.type !== 'button') continue;
+      const d = drawingOf(el, env);
+      if (d && p[0] >= d.box[0] && p[0] <= d.box[0] + d.box[2] && p[1] >= d.box[1] && p[1] <= d.box[1] + d.box[3]) return el.id;
+    }
+    return null;
+  }
   let stroke = null;
   const erasing = new Set();
   surface.addEventListener('pointerdown', (e) => {
-    if (!tool || e.button !== 0) return;
-    e.preventDefault();
+    if (e.button !== 0) return;
     const p = boardPoint(e);
+    if (!tool) {
+      const id = buttonAt(p);
+      if (id) {
+        e.preventDefault();
+        post('/api/choose', { id, agent: 'You' });
+      }
+      return;
+    }
+    e.preventDefault();
     if (tool.kind === 'note') {
       const text = window.prompt('Sticky note text:');
       if (text && text.trim()) {
@@ -763,8 +797,11 @@
     }
   });
   surface.addEventListener('pointermove', (e) => {
-    if (!tool) return;
     const p = boardPoint(e);
+    if (!tool) {
+      surface.style.cursor = buttonAt(p) ? 'pointer' : '';
+      return;
+    }
     if (tool.kind === 'pen' && stroke) {
       const last = stroke.pts[stroke.pts.length - 1];
       if (Math.hypot(p[0] - last[0], p[1] - last[1]) > 1.5) {

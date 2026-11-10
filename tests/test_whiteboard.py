@@ -349,7 +349,8 @@ def test_mcp_server_over_stdio(board_server):
 
         tools = rpc({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})["result"]["tools"]
         names = {t["name"] for t in tools}
-        assert {"draw", "look", "say", "get_board", "erase", "update", "guide"} <= names
+        assert {"draw", "look", "say", "get_board", "erase", "update", "guide",
+                "reorder", "arrange", "wait_for_choice"} <= names
 
         res = rpc({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
             "name": "draw", "arguments": {"elements": [{"type": "sticky", "text": "from MCP"}]}}})["result"]
@@ -362,6 +363,17 @@ def test_mcp_server_over_stdio(board_server):
             "name": "draw", "arguments": {"elements": [{"type": "warp"}]}}})["result"]
         assert bad["isError"] and "unknown element type" in bad["content"][0]["text"]
 
+        rpc({"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {
+            "name": "draw", "arguments": {"elements": [{"type": "button", "id": "ok", "text": "OK", "value": 1}]}}})
+        call(url, "/api/choose", {"id": "ok"})
+        res = rpc({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {
+            "name": "wait_for_choice", "arguments": {"timeout": 5}}})["result"]
+        assert not res["isError"]
+        assert json.loads(res["content"][0]["text"])["chosen"]["value"] == 1
+        res = rpc({"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {
+            "name": "reorder", "arguments": {"ids": ["sticky1"], "to": "front"}}})["result"]
+        assert json.loads(res["content"][0]["text"])["order"] == ["ok", "sticky1"]
+
         missing = rpc({"jsonrpc": "2.0", "id": 5, "method": "nope"})
         assert missing["error"]["code"] == -32601
     finally:
@@ -369,3 +381,235 @@ def test_mcp_server_over_stdio(board_server):
         proc.wait(timeout=10)
         proc.stdout.close()
         proc.stderr.close()
+
+
+# ---------------------------------------------------------------- stacking order
+
+def test_reorder_front_back_and_undo():
+    st = BoardState()
+    st.add([{"type": "rect", "id": i, "x": n * 300, "y": 0} for n, i in enumerate("abc")])
+    assert st.reorder(["a"], "front") == ["b", "c", "a"]
+    assert st.reorder(["c", "a"], "back") == ["c", "a", "b"]
+    assert list(st.elements) == ["c", "a", "b"]
+    assert [e["id"] for e in st.to_dict()["elements"]] == ["c", "a", "b"]
+    assert st.undo()
+    assert list(st.elements) == ["b", "c", "a"]
+    with pytest.raises(BoardError, match="no element with id 'zz'"):
+        st.reorder(["a", "zz"], "front")
+    with pytest.raises(BoardError, match="front"):
+        st.reorder(["a"], "sideways")
+    assert list(st.elements) == ["b", "c", "a"]
+
+
+def test_order_endpoint_emits_an_event(board_server):
+    url, hub = board_server
+    reader = EventReader(url)
+    try:
+        reader.wait_for("hello")
+        call(url, "/api/draw", {"elements": [{"type": "rect", "id": i, "x": n * 300, "y": 0}
+                                             for n, i in enumerate("abc")]})
+        status, res = call(url, "/api/order", {"ids": ["c"], "to": "back"})
+        assert status == 200 and res["order"] == ["c", "a", "b"]
+        ev = reader.wait_for("order")
+        assert (ev["ids"], ev["to"]) == (["c"], "back")
+        _, state = call(url, "/api/state")
+        assert [e["id"] for e in state["elements"]] == ["c", "a", "b"]
+        status, res = call(url, "/api/order", {"ids": ["nope"]})
+        assert status == 400 and "nope" in res["error"]
+    finally:
+        reader.close(hub)
+
+
+# ---------------------------------------------------------------- align & distribute
+
+def _three_rects():
+    st = BoardState()
+    st.add([{"type": "rect", "id": "a", "x": 100, "y": 100, "w": 100, "h": 60},
+            {"type": "rect", "id": "b", "x": 260, "y": 180, "w": 200, "h": 100},
+            {"type": "rect", "id": "c", "x": 700, "y": 140, "w": 100, "h": 80}])
+    return st
+
+
+def test_arrange_aligns_edges_and_centres():
+    st = _three_rects()
+    changed, skipped = st.arrange(["a", "b", "c"], align="top")
+    assert not skipped and {e["id"] for e in changed} == {"b", "c"}
+    assert [st.bbox_of(i)[1] for i in "abc"] == [100, 100, 100]
+    assert [st.bbox_of(i)[0] for i in "abc"] == [100, 260, 700]  # x untouched
+    st.arrange(["a", "b", "c"], align="bottom")
+    assert [st.bbox_of(i)[1] + st.bbox_of(i)[3] for i in "abc"] == [200, 200, 200]
+    st.arrange(["a", "b", "c"], align="center")
+    assert [st.bbox_of(i)[0] + st.bbox_of(i)[2] / 2 for i in "abc"] == [450, 450, 450]
+    st.arrange(["a", "b", "c"], align="right")
+    assert [st.bbox_of(i)[0] + st.bbox_of(i)[2] for i in "abc"] == [550, 550, 550]
+
+
+def test_arrange_distributes_evenly_or_with_a_gap():
+    st = _three_rects()
+    st.arrange(["c", "a", "b"], distribute="horizontal")
+    a, b, c = (st.bbox_of(i) for i in "abc")
+    assert (a[0], c[0]) == (100, 700)  # the outer two stay put
+    assert b[0] - (a[0] + a[2]) == c[0] - (b[0] + b[2]) == 150
+    st.arrange(["a", "b", "c"], distribute="horizontal", gap=30)
+    a, b, c = (st.bbox_of(i) for i in "abc")
+    assert (a[0], b[0], c[0]) == (100, 230, 460)
+    st.arrange(["a", "b", "c"], distribute="vertical", gap=10)
+    a, b, c = (st.bbox_of(i) for i in "abc")
+    assert (a[1], c[1], b[1]) == (100, 170, 260)
+    with pytest.raises(BoardError, match="three or more"):
+        st.arrange(["a", "b"], distribute="horizontal")
+    with pytest.raises(BoardError, match="align"):
+        st.arrange(["a", "b"])
+    with pytest.raises(BoardError, match="no element"):
+        st.arrange(["a", "ghost"], align="left")
+
+
+def test_arrange_handles_other_anchors_and_is_one_undo_step():
+    st = BoardState()
+    st.add([{"type": "rect", "id": "r", "cx": 200, "cy": 200, "w": 100, "h": 100},
+            {"type": "circle", "id": "o", "x": 500, "y": 400, "r": 40},
+            {"type": "line", "id": "l", "points": [[700, 600], [800, 640]], "width": 4},
+            {"type": "rect", "id": "p", "x": 900, "y": 50, "w": 80, "h": 80},
+            {"type": "arrow", "id": "ar", "from": "r", "to": "o"}])
+    before = {i: st.bbox_of(i) for i in "rolp"}
+    changed, skipped = st.arrange(["r", "o", "l", "p", "ar"], align="top", distribute="horizontal", gap=20)
+    assert skipped == ["ar"] and "ar" not in {e["id"] for e in changed}
+    boxes = [st.bbox_of(i) for i in "rolp"]
+    assert all(abs(b[1] - 50) < 0.01 for b in boxes)
+    for left, right in zip(boxes, boxes[1:]):
+        assert abs(right[0] - (left[0] + left[2]) - 20) < 0.01
+    assert all(abs(st.bbox_of(i)[k] - before[i][k]) < 0.01 for i in "rolp" for k in (2, 3))  # sizes kept
+    assert "cx" in st.elements["r"] and st.elements["o"]["r"] == 40
+    assert st.undo()
+    assert {i: st.bbox_of(i) for i in "rolp"} == before
+
+
+def test_arrange_endpoint_clears_overlap_warnings(board_server):
+    url, hub = board_server
+    _, res = call(url, "/api/draw", {"elements": [
+        {"type": "sticky", "id": f"s{n}", "x": 100 + n * 90, "y": 200 + n * 40, "w": 240, "text": f"Note {n}"}
+        for n in range(3)]})
+    assert any("overlaps" in w for w in res["warnings"])
+    status, res = call(url, "/api/arrange", {"ids": ["s0", "s1", "s2"], "align": "top",
+                                             "distribute": "horizontal", "gap": 40})
+    assert status == 200 and "warnings" not in res
+    assert res["moved"] == ["s1", "s2"]
+    boxes = [e["bbox"] for e in res["elements"]]
+    assert [b[1] for b in boxes] == [200, 200, 200]
+    assert [boxes[i + 1][0] - boxes[i][0] - boxes[i][2] for i in range(2)] == [40, 40]
+    status, res = call(url, "/api/arrange", {"ids": ["s0", "s1"], "gap": 5})
+    assert status == 400
+
+
+# ---------------------------------------------------------------- asking the user
+
+BUTTONS = [{"type": "button", "id": "yes", "text": "Yes", "group": "q", "value": {"ship": True}},
+           {"type": "choice", "id": "no", "text": "No", "group": "q"},
+           {"type": "button", "id": "other", "text": "Unrelated"}]
+
+
+def test_button_element_validates_and_marks_one_per_group():
+    st = BoardState()
+    els, _ = st.add(BUTTONS)
+    assert [e["type"] for e in els] == ["button"] * 3
+    w, h = st.bbox_of("yes")[2:]
+    assert 60 < w < 200 and 30 < h < 80
+    with pytest.raises(BoardError, match="button needs 'text'"):
+        st.add([{"type": "button"}])
+    steps = len(st.history)
+    st.choose("other")
+    el, changed = st.choose("yes")
+    assert el["chosen"] is True and [e["id"] for e in changed] == ["yes"]
+    _, changed = st.choose("no")
+    assert {e["id"] for e in changed} == {"yes", "no"}
+    assert "chosen" not in st.elements["yes"] and st.elements["no"]["chosen"]
+    assert st.elements["other"]["chosen"]  # another question is left alone
+    with pytest.raises(BoardError, match="not a button"):
+        st.choose("ghost")
+    # clicks are not undo steps: undo skips them and reverses the last real edit
+    assert len(st.history) == steps
+    st.update("other", {"text": "Renamed"})
+    assert st.undo()
+    assert st.elements["other"]["text"] == "Unrelated"
+    assert st.elements["no"]["chosen"] and "chosen" not in st.elements["yes"]
+
+
+def test_wait_for_choice_returns_the_click(board_server):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": BUTTONS + [{"type": "rect", "id": "r", "x": 900, "y": 600}]})
+    got = {}
+    waiter = threading.Thread(target=lambda: got.update(call(url, "/api/choice?timeout=8")[1]))
+    waiter.start()
+    time.sleep(0.3)
+    assert not got  # still waiting
+    status, res = call(url, "/api/choose", {"id": "yes"})
+    assert status == 200 and res["chosen"]["id"] == "yes"
+    waiter.join(5)
+    assert got["chosen"]["id"] == "yes" and got["chosen"]["text"] == "Yes"
+    assert got["chosen"]["value"] == {"ship": True} and got["chosen"]["group"] == "q"
+
+    # a click made before anyone waits is kept; a change of mind means the last click wins
+    call(url, "/api/choose", {"id": "yes"})
+    call(url, "/api/choose", {"id": "no"})
+    call(url, "/api/choose", {"id": "other"})
+    _, res = call(url, "/api/choice?timeout=2&group=q")
+    assert res["chosen"]["id"] == "no" and res["chosen"]["value"] == "No"
+    _, res = call(url, "/api/choice?timeout=2&ids=other,yes")
+    assert res["chosen"]["id"] == "other"
+
+    started = time.time()
+    _, res = call(url, "/api/choice?timeout=0.3")
+    assert res["chosen"] is None and res["timed_out"] and time.time() - started < 3
+
+    status, res = call(url, "/api/choose", {"id": "r"})
+    assert status == 400 and "not a button" in res["error"]
+    # clicks on a button that has since been erased are dropped
+    call(url, "/api/choose", {"id": "other"})
+    call(url, "/api/erase", {"ids": ["other"]})
+    assert call(url, "/api/choice?timeout=0.2")[1]["chosen"] is None
+
+
+def test_choosing_emits_events_and_marks_the_button(board_server):
+    url, hub = board_server
+    reader = EventReader(url)
+    try:
+        reader.wait_for("hello")
+        call(url, "/api/draw", {"elements": BUTTONS})
+        reader.wait_for("add")
+        call(url, "/api/choose", {"id": "yes"})
+        up = reader.wait_for("update")
+        assert [(e["id"], e.get("chosen")) for e in up["elements"]] == [("yes", True)]
+        ev = reader.wait_for("choice")
+        assert (ev["id"], ev["text"], ev["group"]) == ("yes", "Yes", "q")
+        reader.events.clear()  # wait_for returns the first match, so drop the first click's events
+        call(url, "/api/choose", {"id": "no"})
+        up = reader.wait_for("update")
+        assert {e["id"]: e.get("chosen") for e in up["elements"]} == {"yes": None, "no": True}
+        assert reader.wait_for("choice")["id"] == "no"
+        assert "button" in guide() and "wait_for_choice" in guide()
+    finally:
+        reader.close(hub)
+
+
+def test_clicks_do_not_outlive_their_buttons(board_server):
+    url, hub = board_server
+    # undo reverses the draw that made the buttons: the queued click goes with them
+    call(url, "/api/draw", {"elements": BUTTONS})
+    call(url, "/api/choose", {"id": "no"})
+    call(url, "/api/undo", {})
+    assert "no" not in hub.state.elements
+    assert call(url, "/api/choice?timeout=0.2")[1]["chosen"] is None
+
+    # an undo that leaves the button on the board keeps its click
+    call(url, "/api/draw", {"elements": BUTTONS})
+    call(url, "/api/draw", {"elements": [{"type": "rect", "id": "r", "x": 900, "y": 600}]})
+    call(url, "/api/choose", {"id": "yes"})
+    call(url, "/api/undo", {})
+    assert call(url, "/api/choice?timeout=0.2")[1]["chosen"]["id"] == "yes"
+
+    # loading a board drops clicks made on the previous one, even when it has the same ids
+    call(url, "/api/save", {"name": "question"})
+    call(url, "/api/choose", {"id": "no"})
+    call(url, "/api/load", {"name": "question"})
+    assert "no" in hub.state.elements
+    assert call(url, "/api/choice?timeout=0.2")[1]["chosen"] is None

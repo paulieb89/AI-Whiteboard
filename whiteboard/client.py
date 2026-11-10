@@ -145,6 +145,22 @@ class Whiteboard:
             body["author"] = author
         return self._call("POST", "/api/erase", body)
 
+    def arrange(self, ids: List[str], align: Optional[str] = None, distribute: Optional[str] = None,
+                gap: Optional[float] = None) -> Dict[str, Any]:
+        """Line elements up (align) and/or space them evenly (distribute, optional fixed gap)."""
+        body: Dict[str, Any] = {"ids": list(ids)}
+        if align:
+            body["align"] = align
+        if distribute:
+            body["distribute"] = distribute
+        if gap is not None:
+            body["gap"] = gap
+        return self._call("POST", "/api/arrange", body)
+
+    def reorder(self, ids: Any, to: str = "front") -> Dict[str, Any]:
+        """Change stacking: move elements to the "front" (on top) or the "back"."""
+        return self._call("POST", "/api/order", {"ids": [ids] if isinstance(ids, str) else list(ids), "to": to})
+
     def clear(self, background: Optional[str] = None) -> Dict[str, Any]:
         return self._call("POST", "/api/clear", {"background": background} if background else {})
 
@@ -164,6 +180,20 @@ class Whiteboard:
     def point(self, x: Optional[float] = None, y: Optional[float] = None, id: Optional[str] = None,
               label: Optional[str] = None) -> Dict[str, Any]:
         return self._call("POST", "/api/point", {"x": x, "y": y, "id": id, "label": label})
+
+    def choose(self, id: str) -> Dict[str, Any]:
+        """Click a button on the user's behalf (what the viewer sends on a real click)."""
+        return self._call("POST", "/api/choose", {"id": id})
+
+    def wait_for_choice(self, ids: Optional[List[str]] = None, group: Optional[str] = None,
+                        timeout: float = 60.0) -> Dict[str, Any]:
+        """Wait until the user clicks a button; "chosen" is None if nobody did in time."""
+        q: Dict[str, Any] = {"timeout": timeout}
+        if ids:
+            q["ids"] = ",".join(ids)
+        if group:
+            q["group"] = group
+        return self._call("GET", f"/api/choice?{urlencode(q)}", timeout=float(timeout) + 10)
 
     def board(self, props: bool = False) -> Dict[str, Any]:
         return self._call("GET", "/api/board" + ("?props=1" if props else ""))

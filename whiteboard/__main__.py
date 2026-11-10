@@ -8,6 +8,9 @@ Command line for the AI whiteboard.
     python -m whiteboard say "Hello!"
     python -m whiteboard board                          what is on the board
     python -m whiteboard look out.png                   save a picture of the board
+    python -m whiteboard wait [--timeout 60] [ID...]    wait for the user to click a button
+    python -m whiteboard arrange --align top --distribute horizontal --gap 40 ID ID [ID...]
+    python -m whiteboard order front|back ID [ID...]    change what is drawn on top
     python -m whiteboard erase ID [ID...] | clear | undo
     python -m whiteboard demo [plans|explain|all]       draw a demo board
     python -m whiteboard guide                          element reference for AIs
@@ -72,10 +75,17 @@ def run_ops(wb: Whiteboard, ops: Any, pause: float = 0.0) -> List[Any]:
             results.append(wb.update_many(args.get("updates") or [args]))
         elif kind == "erase":
             results.append(wb.erase(args.get("ids"), args.get("region"), args.get("author")))
+        elif kind == "arrange":
+            results.append(wb.arrange(args.get("ids") or [], args.get("align"), args.get("distribute"),
+                                      args.get("gap")))
+        elif kind == "order":
+            results.append(wb.reorder(args.get("ids") or [args.get("id")], args.get("to", "front")))
         elif kind == "clear":
             results.append(wb.clear(args.get("background")))
         elif kind == "settings":
             results.append(wb.settings(**args))
+        elif kind == "wait_for_choice":
+            results.append(wb.wait_for_choice(args.get("ids"), args.get("group"), args.get("timeout", 60)))
         elif kind == "wait":
             time.sleep(float(args.get("seconds", 1)))
         else:
@@ -111,6 +121,20 @@ def main(argv: List[str] = None) -> int:
     e.add_argument("ids", nargs="*")
     e.add_argument("--region", nargs=4, type=float, metavar=("X", "Y", "W", "H"))
     e.add_argument("--user", action="store_true", help="erase everything the user drew")
+    wt = sub.add_parser("wait", help="wait for the user to click a button, print which one")
+    wt.add_argument("ids", nargs="*", help="only these buttons (default: any)")
+    wt.add_argument("--group")
+    wt.add_argument("--timeout", type=float, default=60.0)
+    ch = sub.add_parser("choose", help="click a button as if the user had (for scripts and tests)")
+    ch.add_argument("id")
+    ar = sub.add_parser("arrange", help="line elements up and/or space them evenly")
+    ar.add_argument("ids", nargs="+")
+    ar.add_argument("--align", choices=["left", "center", "right", "top", "middle", "bottom"])
+    ar.add_argument("--distribute", choices=["horizontal", "vertical"])
+    ar.add_argument("--gap", type=float, help="exact space between elements when distributing")
+    od = sub.add_parser("order", help="bring elements to the front or send them to the back")
+    od.add_argument("to", choices=["front", "back"])
+    od.add_argument("ids", nargs="+")
     c = sub.add_parser("clear", help="wipe the board")
     c.add_argument("--background", choices=["whiteboard", "grid", "dots", "chalkboard", "blueprint"])
     sub.add_parser("undo", help="undo the last change")
@@ -178,6 +202,14 @@ def main(argv: List[str] = None) -> int:
             _print(wb.update(args.id, **_load_json(args.json)))
         elif args.cmd == "erase":
             _print(wb.erase(args.ids or None, args.region, "user" if args.user else None))
+        elif args.cmd == "wait":
+            _print(wb.wait_for_choice(args.ids or None, args.group, args.timeout))
+        elif args.cmd == "choose":
+            _print(wb.choose(args.id))
+        elif args.cmd == "arrange":
+            _print(wb.arrange(args.ids, args.align, args.distribute, args.gap))
+        elif args.cmd == "order":
+            _print(wb.reorder(args.ids, args.to))
         elif args.cmd == "clear":
             _print(wb.clear(args.background))
         elif args.cmd == "undo":

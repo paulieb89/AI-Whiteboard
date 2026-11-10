@@ -82,6 +82,8 @@ frame      {"type":"frame","x":60,"y":160,"w":700,"h":500,"title":"Section","col
 timeline   {"type":"timeline","x":100,"y":700,"w":1200,"items":[{"label":"Jan","text":"Kickoff"},{"label":"Mar","text":"Launch"}],"color":"blue"}
 mindmap    {"type":"mindmap","cx":800,"cy":520,"center":"Ideas","branches":[{"text":"Podcast","children":["Topics","Guests"]},{"text":"Website"}],"radius":260}
 flow       {"type":"flow","x":100,"y":400,"steps":["Idea","Draft","Review","Ship"],"direction":"right|down","shape":"rect|ellipse|diamond","color":"blue"}
+button     {"type":"button","id":"yes","x":300,"y":600,"text":"Yes, ship it","group":"q1","value":"ship","color":"green"}
+           (the user can click it; wait_for_choice returns the click. "chosen": true draws it as picked)
 highlight  {"type":"highlight","x":95,"y":195,"w":300,"h":40,"color":"yellow"}  (translucent highlighter stroke over anything)
 path       {"type":"path","d":"M0 0 C 40 -30, 80 30, 120 0","x":400,"y":300,"scale":2,"color":"black","fill":"orange","width":3}  (any SVG path data)
 image      {"type":"image","src":"https://... or data:image/png;base64,...","x":100,"y":100,"w":300,"frame":"tape|polaroid|none"}"""
@@ -93,6 +95,15 @@ Tips
   avoids overlaps. get_board shows an occupancy map of free cells.
 - Call look after a drawing to see it the way the user does, then fix overlaps
   with update (move with x/y or dx/dy) or erase.
+- arrange tidies a set of ids in one call: "align" (left, center, right, top,
+  middle, bottom) lines them up, "distribute" (horizontal, vertical) evens the
+  spacing, and a "gap" sets the exact space between them. Use it when a reply
+  warns about overlaps.
+- Elements stack in drawing order (get_board lists them back to front). Use
+  reorder to bring ids to the front or send them to the back without moving them.
+- To ask the user something, draw the question and two to five button
+  elements sharing a "group", then call wait_for_choice: it returns the id, text
+  and value of the button they click, and the board shows it as chosen.
 - Keep words short: whiteboards are for headlines, not paragraphs.
 - Use say for one-line commentary from the mascot and point_at to direct the
   user's attention while you explain. To pace a presentation, give say a
