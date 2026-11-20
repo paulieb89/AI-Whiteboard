@@ -613,3 +613,67 @@ def test_clicks_do_not_outlive_their_buttons(board_server):
     call(url, "/api/load", {"name": "question"})
     assert "no" in hub.state.elements
     assert call(url, "/api/choice?timeout=0.2")[1]["chosen"] is None
+
+
+# ---------------------------------------------------------------- layout report validation
+
+NAN, INF = float("nan"), float("inf")
+
+
+@pytest.mark.parametrize("box", [
+    [NAN, 0, 10, 10], [0, NAN, 10, 10], [0, 0, NAN, 10], [0, 0, 10, NAN],
+    [INF, 0, 10, 10], [0, -INF, 10, 10], [0, 0, INF, 10], [0, 0, 10, -INF],
+    ["nan", 0, 10, 10], [0, 0, "inf", 10],
+    [0, 0, 0, 10], [0, 0, 10, 0], [0, 0, -10, 10], [0, 0, 10, -10],
+    [0, 0, None, 10], [0, 0, "wide", 10], [0, 0, [1], 10], [10 ** 400, 0, 10, 10],
+])
+def test_set_bboxes_skips_invalid_boxes(box):
+    st = BoardState()
+    st.add([{"type": "rect", "id": "r", "x": 10, "y": 10, "w": 100, "h": 50}])
+    estimate = st.bbox_of("r")
+    assert st.set_bboxes({"r": box}) == 0
+    assert "r" not in st.bboxes
+    assert st.bbox_of("r") == estimate
+    assert st.summary("r")["bbox_estimated"] is True
+
+    assert st.set_bboxes({"r": [1, 2, 30, 40]}) == 1
+    assert st.set_bboxes({"r": box}) == 0
+    assert st.bboxes["r"] == [1.0, 2.0, 30.0, 40.0]
+    st.describe()
+
+
+def test_set_bboxes_keeps_valid_boxes_next_to_bad_ones():
+    st = BoardState()
+    st.add([{"type": "rect", "id": "a", "x": 10, "y": 10, "w": 100, "h": 50},
+            {"type": "rect", "id": "b", "x": 300, "y": 10, "w": 100, "h": 50},
+            {"type": "rect", "id": "c", "x": 600, "y": 10, "w": 100, "h": 50}])
+    stored = st.set_bboxes({
+        "a": [NAN, 0, 10, 10],
+        "b": [1.26, "2.04", 30.15, True],
+        "c": [0, 0, 0.04, 0.01],
+        "ghost": [0, 0, 10, 10],
+        "d": [0, 0, 10],
+    })
+    assert stored == 2
+    assert "a" not in st.bboxes and "ghost" not in st.bboxes
+    assert st.bboxes["b"] == [1.3, 2.0, 30.1, 1.0]
+    assert st.bboxes["c"] == [0.0, 0.0, 0.04, 0.01]
+    assert st.set_bboxes({"a": "not a list", "b": (0, 0, 5, 5)}) == 0
+    board = st.describe()
+    assert board["count"] == 3
+
+
+def test_bad_layout_report_does_not_break_the_board_api(board_server):
+    url, _ = board_server
+    status, res = call(url, "/api/draw", {"elements": [{"type": "rect", "id": "r", "x": 10, "y": 10, "w": 100, "h": 50}]})
+    assert status == 200 and res["ok"]
+
+    for box in ([NAN, 0, 10, 10], [0, 0, INF, 10], [0, 0, -10, 10], [0, 0, 10, -10]):
+        status, res = call(url, "/api/layout", {"bboxes": {"r": box}})
+        assert status == 200 and res["stored"] == 0
+
+    status, board = call(url, "/api/board")
+    assert status == 200
+    [el] = board["elements"]
+    assert el["id"] == "r" and el["bbox_estimated"] is True
+    assert len(el["bbox"]) == 4 and el["bbox"][2] > 0 and el["bbox"][3] > 0
