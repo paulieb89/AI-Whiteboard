@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import re
 import threading
 from pathlib import Path
@@ -935,10 +936,18 @@ class BoardState:
             for eid, b in (boxes or {}).items():
                 if eid in self.elements and isinstance(b, list) and len(b) == 4:
                     try:
-                        self.bboxes[eid] = [round(float(v), 1) for v in b]
-                        n += 1
-                    except (TypeError, ValueError):
+                        vals = [float(v) for v in b]
+                    except (TypeError, ValueError, OverflowError):
                         continue
+                    if not all(math.isfinite(v) for v in vals) or vals[2] <= 0 or vals[3] <= 0:
+                        continue
+                    box = [round(v, 1) for v in vals]
+                    # keep a tiny but positive size positive instead of rounding it to 0
+                    for i in (2, 3):
+                        if box[i] <= 0:
+                            box[i] = vals[i]
+                    self.bboxes[eid] = box
+                    n += 1
         return n
 
     # ---- reporting ------------------------------------------------------
