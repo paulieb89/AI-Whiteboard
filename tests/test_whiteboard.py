@@ -677,3 +677,514 @@ def test_bad_layout_report_does_not_break_the_board_api(board_server):
     [el] = board["elements"]
     assert el["id"] == "r" and el["bbox_estimated"] is True
     assert len(el["bbox"]) == 4 and el["bbox"][2] > 0 and el["bbox"][3] > 0
+
+
+# ---------------------------------------------------------------- bad input (issue #6)
+
+def post_raw(url, path, data):
+    req = urllib.request.Request(url + path, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}")
+
+
+def test_table_rows_must_be_a_list(board_server):
+    url, hub = board_server
+    status, res = call(url, "/api/draw", {"type": "table", "rows": 5})
+    assert status == 400 and res["ok"] is False and "rows" in res["error"]
+    assert hub.state.elements == {}
+
+    # empty and scalar rows keep working
+    status, res = call(url, "/api/draw", {"elements": [
+        {"type": "table", "id": "t", "rows": [["a", "b"], "c"]},
+        {"type": "table", "id": "e", "rows": []},
+    ]})
+    assert status == 200 and res["ok"]
+    status, res = call(url, "/api/update", {"id": "t", "changes": {"rows": "oops"}})
+    assert status == 400 and "rows" in res["error"]
+    assert hub.state.elements["t"]["rows"] == [["a", "b"], "c"]
+
+
+def test_erase_needs_an_object_body(board_server):
+    url, _ = board_server
+    status, res = call(url, "/api/erase", [1, 2])
+    assert status == 400 and res["ok"] is False
+    assert "object" in res["error"] and "array" in res["error"]
+    status, res = post_raw(url, "/api/erase", b"null")
+    assert status == 400 and "object" in res["error"]
+
+
+def test_object_routes_reject_other_json(board_server):
+    url, _ = board_server
+    for path in ("/api/settings", "/api/point", "/api/load", "/api/layout", "/api/clear", "/api/say"):
+        for body in ([1], "text", 3):
+            status, res = call(url, path, body)
+            assert status == 400 and res["ok"] is False and "object" in res["error"], (path, body)
+
+
+def test_erase_region_must_be_numbers(board_server):
+    url, _ = board_server
+    status, res = call(url, "/api/erase", {"region": ["a", 0, 1, 1]})
+    assert status == 400 and res["ok"] is False
+    assert "region[0]" in res["error"] and "number" in res["error"]
+    status, res = call(url, "/api/erase", {"ids": 5})
+    assert status == 400 and "ids" in res["error"]
+
+
+def test_point_coordinates_must_be_numbers(board_server):
+    url, _ = board_server
+    status, res = call(url, "/api/point", {"x": "abc", "y": 1})
+    assert status == 400 and res["ok"] is False
+    assert "'x'" in res["error"] and "number" in res["error"]
+    status, res = call(url, "/api/point", {"x": 10, "y": 20})
+    assert status == 200 and res["ok"]
+
+
+def test_snapshot_width_must_be_a_number(board_server):
+    url, hub = board_server
+    assert hub.viewers() == 0
+    status, res = call(url, "/api/snapshot?width=abc")
+    assert status == 400 and res["ok"] is False and "width" in res["error"]
+    status, res = call(url, "/api/snapshot?width=viewer&timeout=1")
+    assert status == 400 and "width" in res["error"]
+    status, res = call(url, "/api/snapshot?timeout=soon")
+    assert status == 400 and "timeout" in res["error"]
+    status, res = call(url, "/api/snapshot")  # valid parameters, no viewer
+    assert status == 503
+
+
+@pytest.mark.parametrize("content, expected", [
+    ("{not json", "not valid JSON"),
+    ("[1, 2, 3]", "expected a JSON object"),
+    ('{"elements": {"a": 1}}', "'elements' must be an array"),
+    ('{"settings": [1]}', "'settings' must be an object"),
+])
+def test_loading_a_corrupt_saved_board_is_explained(board_server, content, expected):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [{"type": "title", "id": "keep", "text": "Keep me"}]})
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "broken.json").write_text(content, encoding="utf-8")
+    before, history = hub.state.to_dict(), len(hub.state.history)
+
+    status, res = call(url, "/api/load", {"name": "broken"})
+    assert status == 400 and res["ok"] is False
+    assert "broken" in res["error"] and expected in res["error"]
+    assert hub.state.to_dict() == before
+    assert len(hub.state.history) == history
+
+
+def test_draw_and_update_still_take_arrays_and_objects(board_server):
+    url, hub = board_server
+    status, res = call(url, "/api/draw", [{"type": "rect", "id": "a", "x": 0, "y": 0, "w": 10, "h": 10}])
+    assert status == 200 and res["ok"]
+    status, res = call(url, "/api/draw", {"type": "rect", "id": "b", "x": 50, "y": 0, "w": 10, "h": 10})
+    assert status == 200 and res["ok"]
+    status, res = call(url, "/api/update", [{"id": "a", "changes": {"color": "red"}}])
+    assert status == 200 and hub.state.elements["a"]["color"] == "red"
+    status, res = call(url, "/api/update", {"id": "b", "color": "blue"})
+    assert status == 200 and hub.state.elements["b"]["color"] == "blue"
+    status, res = call(url, "/api/update", 7)
+    assert status == 400 and res["ok"] is False
+    status, res = call(url, "/api/undo", [])  # a route that ignores its body
+    assert status == 200
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("boom"), ValueError("boom"), TypeError("boom"),
+                                 ConnectionResetError("boom"), BrokenPipeError("boom"),
+                                 ConnectionAbortedError("boom")])
+def test_unexpected_errors_are_logged_500s(board_server, monkeypatch, capsys, exc):
+    url, hub = board_server
+
+    def broken(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(hub, "undo", broken)
+    monkeypatch.setattr(hub, "saved", broken)
+    for path, body in (("/api/undo", {}), ("/api/saves", None)):
+        status, res = call(url, path, body)
+        assert status == 500, path
+        assert res["ok"] is False and res["error"]
+        assert type(exc).__name__ in res["error"]
+    err = capsys.readouterr().err
+    assert "Traceback" in err and "boom" in err
+    assert "/api/undo" in err and "/api/saves" in err
+    # the server keeps answering
+    assert call(url, "/api/health")[0] == 200
+
+
+def test_client_reports_http_errors_without_retrying(board_server, monkeypatch):
+    from whiteboard.client import Whiteboard, WhiteboardError
+
+    url, hub = board_server
+    calls = []
+    real_erase = hub.erase
+
+    def counting_erase(*args, **kwargs):
+        calls.append(args)
+        return real_erase(*args, **kwargs)
+
+    monkeypatch.setattr(hub, "erase", counting_erase)
+    wb = Whiteboard(url, autostart=False, open_browser=False)
+    with pytest.raises(WhiteboardError, match=r"region\[0\]"):
+        wb.erase(region=["a", 0, 1, 1])
+    assert len(calls) == 1
+
+    def broken_undo():
+        calls.append("undo")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(hub, "undo", broken_undo)
+    with pytest.raises(WhiteboardError, match="internal server error"):
+        wb.undo()
+    assert calls.count("undo") == 1
+
+
+def test_client_still_retries_a_lost_connection(board_server, monkeypatch):
+    from whiteboard.client import Whiteboard
+
+    url, _ = board_server
+    wb = Whiteboard(url, autostart=False, open_browser=False)
+    real_request = wb._request
+    seen = []
+
+    def flaky(method, path, body=None, **kw):
+        if path != "/api/health":
+            seen.append(path)
+            if len(seen) == 1:
+                raise ConnectionError("server went away")
+        return real_request(method, path, body, **kw)
+
+    monkeypatch.setattr(wb, "_request", flaky)
+    assert wb.undo()["ok"] is False  # nothing to undo, but it answered
+    assert seen == ["/api/undo", "/api/undo"]
+
+
+@pytest.mark.parametrize("element, expected", [
+    ({"type": "table", "id": "t", "rows": 5}, "rows"),
+    ({"type": "rect", "id": ["a"], "x": 0, "y": 0, "w": 10, "h": 10}, "'id' must be a non-empty string"),
+    ({"type": "rect", "x": 0, "y": 0, "w": 10, "h": 10}, "'id' must be a non-empty string"),
+    ({"type": "rect", "id": "r", "x": "left", "y": 0, "w": 10, "h": 10}, "'x'"),
+    ({"type": "nonsense", "id": "n"}, "unknown element type"),
+    ("just text", "expected an object"),
+])
+def test_loading_a_saved_board_with_bad_elements_is_explained(board_server, element, expected):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [{"type": "title", "id": "keep", "text": "Keep me"}]})
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    good = {"type": "rect", "id": "ok", "x": 0, "y": 0, "w": 10, "h": 10}
+    (folder / "broken.json").write_text(json.dumps({"elements": [good, element]}), encoding="utf-8")
+    before, history = hub.state.to_dict(), len(hub.state.history)
+
+    status, res = call(url, "/api/load", {"name": "broken"})
+    assert status == 400 and res["ok"] is False
+    assert "broken" in res["error"] and "index 1" in res["error"] and expected in res["error"]
+    assert hub.state.to_dict() == before
+    assert len(hub.state.history) == history
+    status, res = call(url, "/api/board")
+    assert status == 200 and [e["id"] for e in res["elements"]] == ["keep"]
+
+
+def test_loading_a_saved_board_with_bad_settings_is_explained(board_server):
+    url, hub = board_server
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    for settings, expected in (({"width": "wide"}, "width"), ({"height": 10}, "height"),
+                               ({"background": "lava"}, "background")):
+        (folder / "broken.json").write_text(json.dumps({"settings": settings}), encoding="utf-8")
+        before = hub.state.to_dict()
+        status, res = call(url, "/api/load", {"name": "broken"})
+        assert status == 400 and expected in res["error"], settings
+        assert hub.state.to_dict() == before and hub.state.history == []
+
+
+def test_saved_boards_still_load_and_undo(board_server):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [
+        {"type": "table", "id": "t", "x": 10, "y": 10, "rows": [["a", "b"], ["c", "d"]]},
+        {"type": "arrow", "id": "ar", "from": [0, 0], "to": {"id": "t", "side": "left"}},
+        {"type": "button", "id": "b", "text": "Go", "x": 300, "y": 300},
+    ]})
+    call(url, "/api/settings", {"background": "grid", "width": 2000})
+    assert call(url, "/api/save", {"name": "demo"})[0] == 200
+    saved = hub.state.to_dict()
+    call(url, "/api/clear", {})
+    status, res = call(url, "/api/load", {"name": "demo"})
+    assert status == 200 and res["count"] == 3
+    assert hub.state.to_dict()["elements"] == saved["elements"]
+    assert hub.state.settings["background"] == "grid" and hub.state.settings["width"] == 2000
+    assert call(url, "/api/board")[0] == 200
+    assert call(url, "/api/undo", {})[1]["ok"] is True
+    assert hub.state.elements == {}
+
+
+def test_snapshot_timeout_must_be_a_finite_number(board_server):
+    url, hub = board_server
+    hub.connect()  # a viewer that never answers
+    for value in ("nan", "inf", "-inf", "soon"):
+        status, res = call(url, f"/api/snapshot?timeout={value}")
+        assert status == 400, value
+        assert "timeout" in res["error"] and "viewer" not in res["error"]
+        assert hub.snapshots == {}
+    for value in ("0", "-1"):  # as on main: no time to answer, so the viewer did not answer in time
+        status, res = call(url, f"/api/snapshot?timeout={value}")
+        assert status == 503, value
+        assert "in time" in res["error"]
+        assert hub.snapshots == {}
+
+
+def _prompt_viewer(url, reader, png):
+    def answer():
+        ev = reader.wait_for("snapshot")
+        data = "data:image/png;base64," + base64.b64encode(png).decode()
+        call(url, "/api/snapshot", {"req": ev["req"], "data": data})
+
+    threading.Thread(target=answer, daemon=True).start()
+
+
+@pytest.mark.parametrize("value", ["601", "1e20"])
+def test_a_long_snapshot_timeout_is_allowed(board_server, value):
+    url, hub = board_server
+    reader = EventReader(url)
+    png = b"\x89PNG\r\n\x1a\nfake"
+    try:
+        reader.wait_for("hello")
+        _prompt_viewer(url, reader, png)
+        status, body = call(url, f"/api/snapshot?timeout={value}")
+        assert status == 200 and body == png
+        assert hub.snapshots == {}
+    finally:
+        reader.close(hub)
+
+
+def test_a_huge_snapshot_timeout_does_not_overflow_the_wait(tmp_path):
+    from whiteboard.server import Hub
+
+    hub = Hub(tmp_path, persist=False)
+    hub.connect()
+    png = b"\x89PNG\r\n\x1a\nfake"
+    waits = []
+
+    def answering_wait(timeout=None):
+        waits.append(timeout)
+        threading.Lock().acquire(timeout=timeout)  # free lock: returns at once, but overflows like a real wait
+        rid = next(iter(hub.snapshots))
+        hub.snapshots[rid] = png
+        return True
+
+    hub.cond.wait = answering_wait
+    assert hub.request_snapshot(timeout=1e20) == png
+    assert waits and all(w <= threading.TIMEOUT_MAX for w in waits)
+    assert hub.snapshots == {}
+
+
+def test_a_failed_snapshot_wait_is_not_left_pending(tmp_path, monkeypatch):
+    from whiteboard.server import Hub
+
+    hub = Hub(tmp_path, persist=False)
+    hub.connect()
+
+    def broken_wait(timeout=None):
+        raise RuntimeError("wait failed")
+
+    monkeypatch.setattr(hub.cond, "wait", broken_wait)
+    with pytest.raises(RuntimeError):
+        hub.request_snapshot(timeout=1)
+    assert hub.snapshots == {}
+    monkeypatch.undo()
+    with pytest.raises(BoardError, match="in time"):
+        hub.request_snapshot(timeout=0.05)
+    assert hub.snapshots == {}
+
+
+@pytest.mark.parametrize("content, expected", [
+    ('{"settings": [], "elements": {}}', "'settings' must be an object"),
+    ('{"settings": []}', "'settings' must be an object"),
+    ('{"settings": ""}', "'settings' must be an object"),
+    ('{"elements": {}}', "'elements' must be an array"),
+    ('{"elements": 0}', "'elements' must be an array"),
+    ('{"elements": ""}', "'elements' must be an array"),
+])
+def test_saved_board_fields_of_the_wrong_type_are_not_defaulted(board_server, content, expected):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [{"type": "title", "id": "keep", "text": "Keep me"}]})
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "broken.json").write_text(content, encoding="utf-8")
+    before, history = hub.state.to_dict(), len(hub.state.history)
+
+    status, res = call(url, "/api/load", {"name": "broken"})
+    assert status == 400 and res["ok"] is False and expected in res["error"]
+    assert hub.state.to_dict() == before
+    assert len(hub.state.history) == history
+
+
+def test_saved_board_fields_that_are_missing_or_null_get_defaults(board_server):
+    url, hub = board_server
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    for content in ('{}', '{"settings": null, "elements": null}'):
+        call(url, "/api/draw", {"type": "rect", "id": "r", "x": 0, "y": 0, "w": 10, "h": 10})
+        (folder / "empty.json").write_text(content, encoding="utf-8")
+        status, res = call(url, "/api/load", {"name": "empty"})
+        assert status == 200 and res["count"] == 0, content
+
+
+@pytest.mark.parametrize("arrows", [
+    [{"type": "arrow", "id": "a", "from": "a", "to": [0, 0]}],
+    [{"type": "arrow", "id": "a", "from": [0, 0], "to": {"id": "a", "side": "left"}}],
+    [{"type": "arrow", "id": "a", "from": "b", "to": [0, 0]},
+     {"type": "arrow", "id": "b", "from": [0, 0], "to": "a"}],
+    [{"type": "arrow", "id": "a", "from": "r", "to": "b"},
+     {"type": "arrow", "id": "b", "from": "r", "to": {"id": "c"}},
+     {"type": "arrow", "id": "c", "from": "a", "to": "r"}],
+])
+def test_saved_board_with_cyclic_arrows_is_rejected(board_server, arrows):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [{"type": "title", "id": "keep", "text": "Keep me"}]})
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    rect = {"type": "rect", "id": "r", "x": 0, "y": 0, "w": 10, "h": 10}
+    (folder / "loop.json").write_text(json.dumps({"elements": [rect] + arrows}), encoding="utf-8")
+    before, history = hub.state.to_dict(), len(hub.state.history)
+
+    status, res = call(url, "/api/load", {"name": "loop"})
+    assert status == 400 and res["ok"] is False
+    assert "loop" in res["error"] and "point back to themselves" in res["error"]
+    assert hub.state.to_dict() == before
+    assert len(hub.state.history) == history
+    status, res = call(url, "/api/board")
+    assert status == 200 and [e["id"] for e in res["elements"]] == ["keep"]
+
+
+def test_saved_board_with_chained_arrows_still_loads(board_server):
+    url, hub = board_server
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    elements = [{"type": "rect", "id": "r", "x": 0, "y": 0, "w": 10, "h": 10},
+                {"type": "arrow", "id": "a", "from": "r", "to": [100, 100]},
+                {"type": "arrow", "id": "b", "from": "a", "to": "r"},
+                {"type": "arrow", "id": "c", "from": "a", "to": {"id": "b"}}]
+    (folder / "chain.json").write_text(json.dumps({"elements": elements}), encoding="utf-8")
+    status, res = call(url, "/api/load", {"name": "chain"})
+    assert status == 200 and res["count"] == 4
+    assert call(url, "/api/board")[0] == 200
+
+
+def test_relative_placement_past_the_input_limit_saves_and_loads(board_server):
+    url, hub = board_server
+    status, _ = call(url, "/api/draw", {"type": "rect", "id": "a", "x": 1000000, "y": 0, "w": 10, "h": 10})
+    assert status == 200
+    status, _ = call(url, "/api/draw", {"type": "rect", "id": "b", "right_of": "a", "w": 10, "h": 10})
+    assert status == 200 and hub.state.elements["b"]["x"] == 1000040
+    assert call(url, "/api/save", {"name": "edge"})[0] == 200
+    saved = hub.state.to_dict()["elements"]
+    call(url, "/api/clear", {})
+
+    status, res = call(url, "/api/load", {"name": "edge"})
+    assert status == 200 and res["count"] == 2
+    assert hub.state.to_dict()["elements"] == saved
+    assert call(url, "/api/board")[0] == 200
+
+
+def test_saved_board_numbers_must_still_be_finite(board_server):
+    url, hub = board_server
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    for x in ("Infinity", "NaN", "1e400", "1" + "0" * 400):
+        (folder / "inf.json").write_text(
+            '{"elements": [{"type": "rect", "id": "r", "x": %s, "y": 0}]}' % x, encoding="utf-8")
+        status, res = call(url, "/api/load", {"name": "inf"})
+        assert status == 400 and "'x'" in res["error"] and "out of range" in res["error"], x
+        assert hub.state.elements == {} and hub.state.history == []
+
+
+def test_a_failed_snapshot_broadcast_is_not_left_pending(board_server, monkeypatch, capsys):
+    url, hub = board_server
+    hub.connect()
+
+    def broken_broadcast(event):
+        raise RuntimeError("broadcast failed")
+
+    monkeypatch.setattr(hub, "broadcast", broken_broadcast)
+    status, res = call(url, "/api/snapshot?timeout=1")
+    assert status == 500 and res["ok"] is False and "RuntimeError" in res["error"]
+    assert hub.snapshots == {}
+    assert "broadcast failed" in capsys.readouterr().err
+
+
+def test_a_write_failure_on_the_fallback_500_is_contained(capsys):
+    import io
+    from types import SimpleNamespace
+
+    from whiteboard.server import Handler
+
+    class DeadSocket(io.BytesIO):
+        def write(self, data):
+            raise BrokenPipeError("client went away")
+
+    handler = Handler.__new__(Handler)  # no socket: drive _guarded directly
+    handler.server = SimpleNamespace(verbose=False)
+    handler.command, handler.path = "GET", "/api/board"
+    handler.request_version = "HTTP/1.1"
+    handler.requestline = "GET /api/board HTTP/1.1"
+    handler.close_connection = False
+    handler.wfile = DeadSocket()
+
+    def broken():
+        raise RuntimeError("boom")
+
+    handler._guarded(broken)  # must not raise
+    assert handler.close_connection is True
+    err = capsys.readouterr().err
+    assert "boom" in err and "/api/board" in err
+
+
+@pytest.mark.parametrize("value", [10 ** 400, -(10 ** 400), "1e400"], ids=["huge", "-huge", "1e400"])
+def test_huge_settings_numbers_are_out_of_range(board_server, value):
+    url, hub = board_server
+    status, res = call(url, "/api/settings", {"width": value})
+    assert status == 400 and res["ok"] is False
+    assert "width" in res["error"] and "out of range" in res["error"]
+    assert hub.state.settings["width"] == 1600 and hub.state.history == []
+
+
+@pytest.mark.parametrize("value", [10 ** 400, -(10 ** 400)], ids=["huge", "-huge"])
+def test_a_huge_pause_is_out_of_range(board_server, value):
+    url, hub = board_server
+    status, res = call(url, "/api/pause", {"seconds": value})
+    assert status == 400 and res["ok"] is False
+    assert "seconds" in res["error"] and "out of range" in res["error"]
+    status, res = call(url, "/api/pause", {"seconds": 2})
+    assert status == 200 and res == {"ok": True, "seconds": 2.0}
+
+
+def test_the_largest_drawable_image_saves_and_loads_again(board_server):
+    from whiteboard.state import MAX_ELEMENT_BYTES
+
+    url, hub = board_server
+    prefix = "data:image/png;base64,"
+
+    def image(n):
+        return {"type": "image", "id": "large-image", "x": 0, "y": 0, "w": 100, "h": 100,
+                "src": prefix + "A" * n}
+
+    base = len(json.dumps(BoardState().normalize(image(0), set()), ensure_ascii=False))
+    largest = image(MAX_ELEMENT_BYTES - base)
+    assert len(json.dumps(BoardState().normalize(largest, set()), ensure_ascii=False)) == MAX_ELEMENT_BYTES
+    too_big = image(MAX_ELEMENT_BYTES - base + 1)
+    status, res = call(url, "/api/draw", {"elements": [too_big]})
+    assert status == 400 and "too large" in res["error"]
+
+    status, res = call(url, "/api/draw", {"elements": [largest]})
+    assert status == 200, res
+    drawn = hub.state.to_dict()["elements"]
+    assert call(url, "/api/save", {"name": "big"})[0] == 200
+    assert call(url, "/api/clear", {})[0] == 200
+    assert hub.state.elements == {}
+    status, res = call(url, "/api/load", {"name": "big"})
+    assert status == 200, res
+    assert hub.state.to_dict()["elements"] == drawn

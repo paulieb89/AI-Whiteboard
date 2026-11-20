@@ -14,14 +14,17 @@ the Host header must be a local name (blocks DNS rebinding).
 from __future__ import annotations
 
 import base64
+import binascii
 import copy
 import json
+import math
 import mimetypes
 import os
 import queue
 import sys
 import threading
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,12 +33,53 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .reference import guide
-from .state import BACKGROUNDS, BoardError, BoardState, plain_text
+from .state import BACKGROUNDS, MAX_ELEMENTS, BoardError, BoardState, plain_text
 
 STATIC_DIR = Path(__file__).parent / "static"
 DEFAULT_PORT = 8765
 MAX_BODY = 30 * 1024 * 1024
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
+# POST routes that read named fields from the body, so the body must be a JSON object.
+# /api/draw and /api/update also take a bare array; /api/undo and /api/shutdown ignore the body.
+OBJECT_ROUTES = {
+    "/api/erase", "/api/choose", "/api/arrange", "/api/order", "/api/clear", "/api/settings",
+    "/api/say", "/api/pause", "/api/point", "/api/save", "/api/load", "/api/layout", "/api/snapshot",
+}
+CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
+class ClientGone(Exception):
+    """The HTTP client's socket failed while we read its request or wrote our answer."""
+
+
+def json_type(value: Any) -> str:
+    """The JSON name of a decoded value's type, for error messages."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return type(value).__name__
+
+
+def number(value: Any, name: str) -> float:
+    """A finite number from request input, or a BoardError naming the parameter."""
+    if isinstance(value, bool):
+        raise BoardError(f"'{name}' must be a number, got {value!r}")
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise BoardError(f"'{name}' must be a number, got {value!r}") from None
+    if not math.isfinite(out):
+        raise BoardError(f"'{name}' must be a finite number, got {value!r}")
+    return out
 
 
 def static_build() -> str:
@@ -104,6 +148,8 @@ class Hub:
 
     # ---- layout feedback --------------------------------------------------
     def report_layout(self, boxes: Dict[str, Any]) -> int:
+        if not isinstance(boxes, dict):
+            raise BoardError(f"'bboxes' must be an object of id -> [x, y, w, h], got {json_type(boxes)}")
         n = self.state.set_bboxes(boxes)
         with self.cond:
             self.cond.notify_all()
@@ -130,21 +176,28 @@ class Hub:
         rid = uuid.uuid4().hex[:12]
         with self.cond:
             self.snapshots[rid] = None
-        self.broadcast({"type": "snapshot", "req": rid, "format": fmt, "width": width})
-        deadline = time.time() + timeout
-        with self.cond:
-            while self.snapshots.get(rid) is None:
-                left = deadline - time.time()
-                if left <= 0:
-                    self.snapshots.pop(rid, None)
-                    raise BoardError("the viewer did not answer the snapshot request in time")
-                self.cond.wait(left)
-            return self.snapshots.pop(rid)
+        try:
+            self.broadcast({"type": "snapshot", "req": rid, "format": fmt, "width": width})
+            deadline = time.time() + timeout
+            with self.cond:
+                while self.snapshots.get(rid) is None:
+                    left = deadline - time.time()
+                    if left <= 0:
+                        raise BoardError("the viewer did not answer the snapshot request in time")
+                    # a huge timeout is allowed, but a single wait longer than TIMEOUT_MAX overflows
+                    self.cond.wait(min(left, threading.TIMEOUT_MAX))
+                return self.snapshots[rid]
+        finally:
+            with self.cond:
+                self.snapshots.pop(rid, None)  # answered, timed out or failed: never leave it pending
 
     def deliver_snapshot(self, rid: str, data_url: str) -> bool:
         if "," not in data_url:
             return False
-        raw = base64.b64decode(data_url.split(",", 1)[1])
+        try:
+            raw = base64.b64decode(data_url.split(",", 1)[1])
+        except (binascii.Error, ValueError):
+            raise BoardError("snapshot 'data' is not valid base64") from None
         with self.cond:
             if rid not in self.snapshots or self.snapshots[rid] is not None:
                 return False
@@ -220,6 +273,8 @@ class Hub:
         return self._result(ids, measured)
 
     def update(self, updates: List[Dict[str, Any]], agent: Optional[str] = None) -> Dict[str, Any]:
+        if not isinstance(updates, list):
+            raise BoardError(f"update needs an object with an 'id' or a list of them, got {json_type(updates)}")
         changed = []
         for u in updates:
             if not isinstance(u, dict) or not u.get("id"):
@@ -236,11 +291,16 @@ class Hub:
     def erase(self, ids: Optional[List[str]] = None, region: Optional[List[float]] = None,
               author: Optional[str] = None, agent: Optional[str] = None,
               origin: Optional[str] = None) -> Dict[str, Any]:
+        if isinstance(ids, str):
+            ids = [ids]
+        if ids is not None and not isinstance(ids, list):
+            raise BoardError(f"'ids' must be a list of element ids, got {json_type(ids)}")
         targets: List[str] = [str(i) for i in (ids or [])]
         if region is not None:
             if not isinstance(region, list) or len(region) != 4:
                 raise BoardError("region must be [x, y, w, h]")
-            targets += self.state.ids_in_region([float(v) for v in region], author)
+            box = [number(v, f"region[{i}]") for i, v in enumerate(region)]
+            targets += self.state.ids_in_region(box, author)
         elif author and not ids:
             targets += [i for i, e in self.state.elements.items() if e.get("author") == author]
         unknown = [i for i in targets if i not in self.state.elements]
@@ -317,18 +377,21 @@ class Hub:
             secs = max(0.0, min(float(seconds), 30.0))
         except (TypeError, ValueError):
             raise BoardError("pause needs a number of seconds") from None
+        except OverflowError:
+            raise BoardError("'seconds' is out of range") from None
         self.broadcast({"type": "pause", "seconds": secs})
         return {"ok": True, "seconds": secs}
 
     def point(self, x: Optional[float] = None, y: Optional[float] = None, eid: Optional[str] = None,
               label: Optional[str] = None, agent: Optional[str] = None) -> Dict[str, Any]:
         if eid:
+            eid = str(eid)
             b = self.state.bbox_of(eid)
             if not b:
                 raise BoardError(f"no element with id {eid!r}")
             ev = {"type": "point", "id": eid, "bbox": b}
         elif x is not None and y is not None:
-            ev = {"type": "point", "x": float(x), "y": float(y)}
+            ev = {"type": "point", "x": number(x, "x"), "y": number(y, "y")}
         else:
             raise BoardError("point_at needs an element id or x and y")
         ev["label"] = label
@@ -348,7 +411,7 @@ class Hub:
         path = self.data_dir / "saved" / f"{safe}.json"
         if not safe or not path.exists():
             raise BoardError(f"no saved board named {name!r}; saved: {', '.join(self.saved()) or 'none'}")
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = self._read_saved(safe, path)
         with self.state.lock:
             # one undo step restores the board as it was before the load
             before = {eid: copy.deepcopy(e) for eid, e in self.state.elements.items()}
@@ -362,6 +425,111 @@ class Hub:
         self.state.schedule_save()
         self.broadcast({"type": "sync", "state": self.state.to_dict(), "animate": True})
         return {"ok": True, "name": safe, "count": len(self.state.elements)}
+
+    def _read_saved(self, safe: str, path: Path) -> Dict[str, Any]:
+        """Parse and validate a saved board file, reporting a corrupt one as a BoardError.
+
+        Everything is checked here, before load() touches the live board or its undo history.
+        """
+        raw = path.read_bytes()  # filesystem errors are server faults, not bad input
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            raise BoardError(f"saved board {safe!r} is not valid UTF-8 text") from None
+        except json.JSONDecodeError as exc:
+            raise BoardError(f"saved board {safe!r} is not valid JSON: {exc}") from None
+        if not isinstance(data, dict):
+            raise BoardError(f"saved board {safe!r} is not a board: expected a JSON object, "
+                             f"got {json_type(data)}")
+        # only a missing or null field gets its default; a wrong type is an error, not an empty board
+        settings = data.get("settings")
+        settings = {} if settings is None else settings
+        elements = data.get("elements")
+        elements = [] if elements is None else elements
+        if not isinstance(settings, dict):
+            raise BoardError(f"saved board {safe!r} is not a board: 'settings' must be an object")
+        if not isinstance(elements, list):
+            raise BoardError(f"saved board {safe!r} is not a board: 'elements' must be an array")
+        if len(elements) > MAX_ELEMENTS:
+            raise BoardError(f"saved board {safe!r} has more than {MAX_ELEMENTS} elements")
+        out = {"settings": self._saved_settings(safe, settings),
+               "elements": self._saved_elements(safe, elements)}
+        self._check_saved_links(safe, out["elements"])
+        return out
+
+    @staticmethod
+    def _saved_settings(safe: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in settings.items():
+            if k == "background":
+                if v not in BACKGROUNDS:
+                    raise BoardError(f"saved board {safe!r} has an unknown background; "
+                                     f"expected one of {', '.join(BACKGROUNDS)}")
+                out[k] = v
+            elif k in ("width", "height"):
+                try:
+                    size = int(number(v, k))
+                except BoardError as exc:
+                    raise BoardError(f"saved board {safe!r} has bad settings: {exc}") from None
+                if not 400 <= size <= 6000:
+                    raise BoardError(f"saved board {safe!r} has bad settings: {k} must be between 400 and 6000")
+                out[k] = size
+            elif k == "mascot":
+                out[k] = bool(v)
+        return out
+
+    def _saved_elements(self, safe: str, elements: List[Any]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        taken: set = set()
+        for i, raw in enumerate(elements):
+            where = f"saved board {safe!r} has a bad element at index {i}"
+            if not isinstance(raw, dict):
+                raise BoardError(f"{where}: expected an object, got {json_type(raw)}")
+            if not isinstance(raw.get("id"), str) or not raw["id"]:
+                raise BoardError(f"{where}: 'id' must be a non-empty string")
+            try:
+                # the checks a drawn element gets, except the input range and size limits: the
+                # server's own placement and added fields can put an element past them, and a
+                # board the server saved must load again
+                el = self.state.normalize(raw, taken, bound=math.inf, limit_size=False)
+            except BoardError as exc:
+                raise BoardError(f"{where} ({raw['id']!r}): {exc}") from None
+            taken.add(el["id"])
+            out.append(el)
+        return out
+
+    @staticmethod
+    def _check_saved_links(safe: str, elements: List[Dict[str, Any]]) -> None:
+        """Reject arrows whose ends lead back to themselves: their bbox would never resolve."""
+        links: Dict[str, List[str]] = {}
+        for el in elements:
+            if el["type"] == "arrow":
+                ends = [el[end] for end in ("from", "to")]
+                links[el["id"]] = [str(v["id"]) if isinstance(v, dict) else v
+                                   for v in ends if isinstance(v, (str, dict))]
+        done: set = set()
+        for start in links:
+            if start in done:
+                continue
+            path = [start]  # iterative depth-first search: a long chain must not hit the recursion limit
+            on_path = {start}
+            stack = [iter(links[start])]
+            while stack:
+                nxt = next(stack[-1], None)
+                if nxt is None:
+                    stack.pop()
+                    finished = path.pop()
+                    on_path.discard(finished)
+                    done.add(finished)
+                    continue
+                if nxt in on_path:
+                    cycle = path[path.index(nxt):] + [nxt]
+                    raise BoardError(f"saved board {safe!r} has arrows that point back to themselves: "
+                                     f"{' -> '.join(cycle)}")
+                if nxt in links and nxt not in done:
+                    path.append(nxt)
+                    on_path.add(nxt)
+                    stack.append(iter(links[nxt]))
 
     def saved(self) -> List[str]:
         folder = self.data_dir / "saved"
@@ -400,16 +568,44 @@ class Handler(BaseHTTPRequestHandler):
             sys.stderr.write("[whiteboard] " + (fmt % args) + "\n")
 
     # ---- helpers ----------------------------------------------------------
+    def send_response(self, code: int, message: Optional[str] = None) -> None:
+        self._started = True  # from here on a second response would corrupt the stream
+        super().send_response(code, message)
+
+    def _guarded(self, handle) -> None:
+        """Run one request; an unexpected exception becomes a logged JSON 500, never a dropped connection."""
+        self._started = False
+        try:
+            handle()
+        except ClientGone:
+            # only raised around our own socket I/O: the same errors from anywhere else are server faults
+            self.close_connection = True  # the client went away; nobody to answer
+        except Exception as exc:
+            self.close_connection = True
+            sys.stderr.write(f"[whiteboard] unexpected error handling {self.command} {self.path}:\n"
+                             f"{traceback.format_exc()}")
+            sys.stderr.flush()
+            if self._started:
+                return  # the response already began; closing the connection is all we can do
+            try:
+                self._error(500, f"internal server error ({type(exc).__name__}); "
+                                 "details are in the server's log")
+            except (ClientGone, OSError):
+                pass  # the client is gone too; the error is already in the log
+
     def _send(self, status: int, body: bytes, ctype: str, extra: Optional[Dict[str, str]] = None) -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        for k, v in (extra or {}).items():
-            self.send_header(k, v)
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except CLIENT_GONE as exc:
+            raise ClientGone() from exc
 
     def _json(self, status: int, obj: Any) -> None:
         self._send(status, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
@@ -435,7 +631,10 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_BODY:
             self.close_connection = True
             raise BoardError("request body too large")
-        return self.rfile.read(length) if length > 0 else b""
+        try:
+            return self.rfile.read(length) if length > 0 else b""
+        except CLIENT_GONE as exc:
+            raise ClientGone() from exc
 
     def _body(self) -> Any:
         raw = self._raw
@@ -455,6 +654,12 @@ class Handler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self) -> None:
+        self._guarded(self._get)
+
+    def do_POST(self) -> None:
+        self._guarded(self._post)
+
+    def _get(self) -> None:
         if not self._host_ok():
             return self._error(403, "host not allowed")
         url = urlparse(self.path)
@@ -488,9 +693,16 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/snapshot":
                 fmt = qs.get("format", ["png"])[0]
                 fmt = "jpeg" if fmt in ("jpg", "jpeg") else "png"
-                width = int(qs.get("width", ["1600"])[0])
-                data = self.hub.request_snapshot(fmt, max(200, min(width, 4000)),
-                                                 float(qs.get("timeout", ["8"])[0]))
+                # the messages don't echo the value: a BoardError mentioning "viewer" becomes a 503
+                try:
+                    width = int(qs.get("width", ["1600"])[0])
+                except ValueError:
+                    raise BoardError("'width' must be a whole number of pixels") from None
+                try:
+                    timeout = number(qs.get("timeout", ["8"])[0], "timeout")
+                except BoardError:
+                    raise BoardError("'timeout' must be a number of seconds") from None
+                data = self.hub.request_snapshot(fmt, max(200, min(width, 4000)), timeout)
                 return self._send(200, data, f"image/{fmt}")
             if path == "/api/choice":
                 ids = [i for i in ",".join(qs.get("ids", [])).split(",") if i]
@@ -502,7 +714,7 @@ class Handler(BaseHTTPRequestHandler):
         except BoardError as exc:
             return self._error(400 if "viewer" not in str(exc) else 503, str(exc))
 
-    def do_POST(self) -> None:
+    def _post(self) -> None:
         try:
             self._raw = self._read_raw()
         except BoardError as exc:
@@ -515,6 +727,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             body = self._body()
+            if path in OBJECT_ROUTES and not isinstance(body, dict):
+                raise BoardError(f"{path} needs a JSON object body, got {json_type(body)}")
             hub = self.hub
             agent = self._agent(body)
             if path == "/api/draw":
@@ -625,7 +839,7 @@ class Handler(BaseHTTPRequestHandler):
                 if ev is None:
                     break
                 self._push(ev)
-        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, OSError):
+        except (ClientGone, OSError):
             pass
         finally:
             self.hub.disconnect(cid)
