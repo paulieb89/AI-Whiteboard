@@ -180,17 +180,18 @@ class Hub:
         rid = uuid.uuid4().hex[:12]
         with self.cond:
             self.snapshots[rid] = None
-        self.broadcast({"type": "snapshot", "req": rid, "format": fmt, "width": width})
-        deadline = time.time() + timeout
-        with self.cond:
-            try:
+        try:
+            self.broadcast({"type": "snapshot", "req": rid, "format": fmt, "width": width})
+            deadline = time.time() + timeout
+            with self.cond:
                 while self.snapshots.get(rid) is None:
                     left = deadline - time.time()
                     if left <= 0:
                         raise BoardError("the viewer did not answer the snapshot request in time")
                     self.cond.wait(left)
                 return self.snapshots[rid]
-            finally:
+        finally:
+            with self.cond:
                 self.snapshots.pop(rid, None)  # answered, timed out or failed: never leave it pending
 
     def deliver_snapshot(self, rid: str, data_url: str) -> bool:
@@ -441,16 +442,21 @@ class Hub:
         if not isinstance(data, dict):
             raise BoardError(f"saved board {safe!r} is not a board: expected a JSON object, "
                              f"got {json_type(data)}")
-        settings = data.get("settings") or {}
-        elements = data.get("elements") or []
+        # only a missing or null field gets its default; a wrong type is an error, not an empty board
+        settings = data.get("settings")
+        settings = {} if settings is None else settings
+        elements = data.get("elements")
+        elements = [] if elements is None else elements
         if not isinstance(settings, dict):
             raise BoardError(f"saved board {safe!r} is not a board: 'settings' must be an object")
         if not isinstance(elements, list):
             raise BoardError(f"saved board {safe!r} is not a board: 'elements' must be an array")
         if len(elements) > MAX_ELEMENTS:
             raise BoardError(f"saved board {safe!r} has more than {MAX_ELEMENTS} elements")
-        return {"settings": self._saved_settings(safe, settings),
-                "elements": self._saved_elements(safe, elements)}
+        out = {"settings": self._saved_settings(safe, settings),
+               "elements": self._saved_elements(safe, elements)}
+        self._check_saved_links(safe, out["elements"])
+        return out
 
     @staticmethod
     def _saved_settings(safe: str, settings: Dict[str, Any]) -> Dict[str, Any]:
@@ -483,12 +489,47 @@ class Hub:
             if not isinstance(raw.get("id"), str) or not raw["id"]:
                 raise BoardError(f"{where}: 'id' must be a non-empty string")
             try:
-                el = self.state.normalize(raw, taken)  # the same checks a drawn element gets
+                # the checks a drawn element gets, except the input range limit: the server's own
+                # relative placement can put an element past it, and such a board must load again
+                el = self.state.normalize(raw, taken, bound=math.inf)
             except BoardError as exc:
                 raise BoardError(f"{where} ({raw['id']!r}): {exc}") from None
             taken.add(el["id"])
             out.append(el)
         return out
+
+    @staticmethod
+    def _check_saved_links(safe: str, elements: List[Dict[str, Any]]) -> None:
+        """Reject arrows whose ends lead back to themselves: their bbox would never resolve."""
+        links: Dict[str, List[str]] = {}
+        for el in elements:
+            if el["type"] == "arrow":
+                ends = [el[end] for end in ("from", "to")]
+                links[el["id"]] = [str(v["id"]) if isinstance(v, dict) else v
+                                   for v in ends if isinstance(v, (str, dict))]
+        done: set = set()
+        for start in links:
+            if start in done:
+                continue
+            path = [start]  # iterative depth-first search: a long chain must not hit the recursion limit
+            on_path = {start}
+            stack = [iter(links[start])]
+            while stack:
+                nxt = next(stack[-1], None)
+                if nxt is None:
+                    stack.pop()
+                    finished = path.pop()
+                    on_path.discard(finished)
+                    done.add(finished)
+                    continue
+                if nxt in on_path:
+                    cycle = path[path.index(nxt):] + [nxt]
+                    raise BoardError(f"saved board {safe!r} has arrows that point back to themselves: "
+                                     f"{' -> '.join(cycle)}")
+                if nxt in links and nxt not in done:
+                    path.append(nxt)
+                    on_path.add(nxt)
+                    stack.append(iter(links[nxt]))
 
     def saved(self) -> List[str]:
         folder = self.data_dir / "saved"
@@ -549,8 +590,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 self._error(500, f"internal server error ({type(exc).__name__}); "
                                  "details are in the server's log")
-            except OSError:
-                pass
+            except (ClientGone, OSError):
+                pass  # the client is gone too; the error is already in the log
 
     def _send(self, status: int, body: bytes, ctype: str, extra: Optional[Dict[str, str]] = None) -> None:
         try:

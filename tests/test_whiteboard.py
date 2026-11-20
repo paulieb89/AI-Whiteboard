@@ -949,3 +949,155 @@ def test_a_failed_snapshot_wait_is_not_left_pending(tmp_path, monkeypatch):
     with pytest.raises(BoardError, match="in time"):
         hub.request_snapshot(timeout=0.05)
     assert hub.snapshots == {}
+
+
+@pytest.mark.parametrize("content, expected", [
+    ('{"settings": [], "elements": {}}', "'settings' must be an object"),
+    ('{"settings": []}', "'settings' must be an object"),
+    ('{"settings": ""}', "'settings' must be an object"),
+    ('{"elements": {}}', "'elements' must be an array"),
+    ('{"elements": 0}', "'elements' must be an array"),
+    ('{"elements": ""}', "'elements' must be an array"),
+])
+def test_saved_board_fields_of_the_wrong_type_are_not_defaulted(board_server, content, expected):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [{"type": "title", "id": "keep", "text": "Keep me"}]})
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "broken.json").write_text(content, encoding="utf-8")
+    before, history = hub.state.to_dict(), len(hub.state.history)
+
+    status, res = call(url, "/api/load", {"name": "broken"})
+    assert status == 400 and res["ok"] is False and expected in res["error"]
+    assert hub.state.to_dict() == before
+    assert len(hub.state.history) == history
+
+
+def test_saved_board_fields_that_are_missing_or_null_get_defaults(board_server):
+    url, hub = board_server
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    for content in ('{}', '{"settings": null, "elements": null}'):
+        call(url, "/api/draw", {"type": "rect", "id": "r", "x": 0, "y": 0, "w": 10, "h": 10})
+        (folder / "empty.json").write_text(content, encoding="utf-8")
+        status, res = call(url, "/api/load", {"name": "empty"})
+        assert status == 200 and res["count"] == 0, content
+
+
+@pytest.mark.parametrize("arrows", [
+    [{"type": "arrow", "id": "a", "from": "a", "to": [0, 0]}],
+    [{"type": "arrow", "id": "a", "from": [0, 0], "to": {"id": "a", "side": "left"}}],
+    [{"type": "arrow", "id": "a", "from": "b", "to": [0, 0]},
+     {"type": "arrow", "id": "b", "from": [0, 0], "to": "a"}],
+    [{"type": "arrow", "id": "a", "from": "r", "to": "b"},
+     {"type": "arrow", "id": "b", "from": "r", "to": {"id": "c"}},
+     {"type": "arrow", "id": "c", "from": "a", "to": "r"}],
+])
+def test_saved_board_with_cyclic_arrows_is_rejected(board_server, arrows):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [{"type": "title", "id": "keep", "text": "Keep me"}]})
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    rect = {"type": "rect", "id": "r", "x": 0, "y": 0, "w": 10, "h": 10}
+    (folder / "loop.json").write_text(json.dumps({"elements": [rect] + arrows}), encoding="utf-8")
+    before, history = hub.state.to_dict(), len(hub.state.history)
+
+    status, res = call(url, "/api/load", {"name": "loop"})
+    assert status == 400 and res["ok"] is False
+    assert "loop" in res["error"] and "point back to themselves" in res["error"]
+    assert hub.state.to_dict() == before
+    assert len(hub.state.history) == history
+    status, res = call(url, "/api/board")
+    assert status == 200 and [e["id"] for e in res["elements"]] == ["keep"]
+
+
+def test_saved_board_with_chained_arrows_still_loads(board_server):
+    url, hub = board_server
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    elements = [{"type": "rect", "id": "r", "x": 0, "y": 0, "w": 10, "h": 10},
+                {"type": "arrow", "id": "a", "from": "r", "to": [100, 100]},
+                {"type": "arrow", "id": "b", "from": "a", "to": "r"},
+                {"type": "arrow", "id": "c", "from": "a", "to": {"id": "b"}}]
+    (folder / "chain.json").write_text(json.dumps({"elements": elements}), encoding="utf-8")
+    status, res = call(url, "/api/load", {"name": "chain"})
+    assert status == 200 and res["count"] == 4
+    assert call(url, "/api/board")[0] == 200
+
+
+def test_relative_placement_past_the_input_limit_saves_and_loads(board_server):
+    url, hub = board_server
+    status, _ = call(url, "/api/draw", {"type": "rect", "id": "a", "x": 1000000, "y": 0, "w": 10, "h": 10})
+    assert status == 200
+    status, _ = call(url, "/api/draw", {"type": "rect", "id": "b", "right_of": "a", "w": 10, "h": 10})
+    assert status == 200 and hub.state.elements["b"]["x"] == 1000040
+    assert call(url, "/api/save", {"name": "edge"})[0] == 200
+    saved = hub.state.to_dict()["elements"]
+    call(url, "/api/clear", {})
+
+    status, res = call(url, "/api/load", {"name": "edge"})
+    assert status == 200 and res["count"] == 2
+    assert hub.state.to_dict()["elements"] == saved
+    assert call(url, "/api/board")[0] == 200
+
+
+def test_saved_board_numbers_must_still_be_finite(board_server):
+    url, hub = board_server
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    for x in ("Infinity", "NaN", "1e400", "1" + "0" * 400):
+        (folder / "inf.json").write_text(
+            '{"elements": [{"type": "rect", "id": "r", "x": %s, "y": 0}]}' % x, encoding="utf-8")
+        status, res = call(url, "/api/load", {"name": "inf"})
+        assert status == 400 and "'x'" in res["error"] and "out of range" in res["error"], x
+        assert hub.state.elements == {} and hub.state.history == []
+
+
+def test_a_failed_snapshot_broadcast_is_not_left_pending(board_server, monkeypatch, capsys):
+    url, hub = board_server
+    hub.connect()
+
+    def broken_broadcast(event):
+        raise RuntimeError("broadcast failed")
+
+    monkeypatch.setattr(hub, "broadcast", broken_broadcast)
+    status, res = call(url, "/api/snapshot?timeout=1")
+    assert status == 500 and res["ok"] is False and "RuntimeError" in res["error"]
+    assert hub.snapshots == {}
+    assert "broadcast failed" in capsys.readouterr().err
+
+
+def test_a_write_failure_on_the_fallback_500_is_contained(capsys):
+    import io
+    from types import SimpleNamespace
+
+    from whiteboard.server import Handler
+
+    class DeadSocket(io.BytesIO):
+        def write(self, data):
+            raise BrokenPipeError("client went away")
+
+    handler = Handler.__new__(Handler)  # no socket: drive _guarded directly
+    handler.server = SimpleNamespace(verbose=False)
+    handler.command, handler.path = "GET", "/api/board"
+    handler.request_version = "HTTP/1.1"
+    handler.requestline = "GET /api/board HTTP/1.1"
+    handler.close_connection = False
+    handler.wfile = DeadSocket()
+
+    def broken():
+        raise RuntimeError("boom")
+
+    handler._guarded(broken)  # must not raise
+    assert handler.close_connection is True
+    err = capsys.readouterr().err
+    assert "boom" in err and "/api/board" in err
+
+
+@pytest.mark.parametrize("value", [10 ** 400, -(10 ** 400), "1e400"], ids=["huge", "-huge", "1e400"])
+def test_huge_settings_numbers_are_out_of_range(board_server, value):
+    url, hub = board_server
+    status, res = call(url, "/api/settings", {"width": value})
+    assert status == 400 and res["ok"] is False
+    assert "width" in res["error"] and "out of range" in res["error"]
+    assert hub.state.settings["width"] == 1600 and hub.state.history == []

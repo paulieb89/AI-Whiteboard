@@ -106,30 +106,35 @@ class BoardError(ValueError):
 # Small geometry helpers
 # --------------------------------------------------------------------------
 
-def _num(value: Any, field: str) -> float:
+MAX_COORD = 1e6  # the largest number a request may give; the server's own placement can go further
+
+
+def _num(value: Any, field: str, bound: float = MAX_COORD) -> float:
     if isinstance(value, bool):
         raise BoardError(f"'{field}' must be a number, got {value!r}")
-    if isinstance(value, (int, float)):
-        out = float(value)
-    else:
-        try:
+    try:
+        if isinstance(value, (int, float)):
+            out = float(value)
+        else:
             out = float(str(value).strip().rstrip("px"))
-        except ValueError:
-            raise BoardError(f"'{field}' must be a number, got {value!r}") from None
-    if out != out or abs(out) > 1e6:
+    except OverflowError:  # an integer too big for a float
+        raise BoardError(f"'{field}' is out of range") from None
+    except ValueError:
+        raise BoardError(f"'{field}' must be a number, got {value!r}") from None
+    if not math.isfinite(out) or abs(out) > bound:
         raise BoardError(f"'{field}' is out of range: {value!r}")
     return int(out) if out.is_integer() else round(out, 2)
 
 
-def _point(value: Any, field: str) -> List[float]:
+def _point(value: Any, field: str, bound: float = MAX_COORD) -> List[float]:
     if isinstance(value, dict) and "x" in value and "y" in value:
-        return [_num(value["x"], field), _num(value["y"], field)]
+        return [_num(value["x"], field, bound), _num(value["y"], field, bound)]
     if isinstance(value, (list, tuple)) and len(value) >= 2:
-        return [_num(value[0], field), _num(value[1], field)]
+        return [_num(value[0], field, bound), _num(value[1], field, bound)]
     raise BoardError(f"'{field}' must be a point [x, y]")
 
 
-def _points(value: Any, field: str = "points") -> List[List[float]]:
+def _points(value: Any, field: str = "points", bound: float = MAX_COORD) -> List[List[float]]:
     if not isinstance(value, (list, tuple)) or not value:
         raise BoardError(f"'{field}' must be a list of [x, y] points")
     if all(isinstance(v, (int, float)) for v in value):  # flat [x1, y1, x2, y2, ...]
@@ -138,7 +143,7 @@ def _points(value: Any, field: str = "points") -> List[List[float]]:
         value = [value[i:i + 2] for i in range(0, len(value), 2)]
     if len(value) > MAX_POINTS:
         raise BoardError(f"'{field}' has too many points (max {MAX_POINTS})")
-    return [_point(p, field) for p in value]
+    return [_point(p, field, bound) for p in value]
 
 
 def rects_intersect(a, b, margin: float = 0.0) -> bool:
@@ -383,7 +388,8 @@ class BoardState:
             n += 1
         return f"{kind}{n}"
 
-    def normalize(self, raw: Any, taken: set) -> Dict[str, Any]:
+    def normalize(self, raw: Any, taken: set, bound: float = MAX_COORD) -> Dict[str, Any]:
+        """Validate one element. `bound` caps every number; saved boards pass math.inf (finite only)."""
         if not isinstance(raw, dict):
             raise BoardError(f"each element must be a JSON object, got {type(raw).__name__}")
         el = dict(raw)
@@ -402,7 +408,7 @@ class BoardState:
                 if field == "width" and kind in ("text", "title") and el[field] == "auto":
                     del el[field]
                     continue
-                el[field] = _num(el[field], field)
+                el[field] = _num(el[field], field, bound)
             elif field in el:
                 del el[field]
         for field in ("w", "h", "size", "r"):
@@ -415,7 +421,7 @@ class BoardState:
                 el[field] = min(el[field], 20000)
 
         if kind == "line":
-            el["points"] = _points(el.get("points"))
+            el["points"] = _points(el.get("points"), bound=bound)
         if kind == "arrow":
             for end in ("from", "to"):
                 if end not in el:
@@ -426,12 +432,12 @@ class BoardState:
                 if isinstance(v, dict) and "id" in v:
                     el[end] = {"id": str(v["id"]), **{k: v[k] for k in ("side",) if k in v}}
                 else:
-                    el[end] = _point(v, end)
+                    el[end] = _point(v, end, bound)
         if kind == "table" and el.get("rows") is not None and not isinstance(el["rows"], list):
             raise BoardError(f"table 'rows' must be a list of rows (each a list of cells), "
                              f"got {type(el['rows']).__name__}")
         if kind == "bubble" and "tail" in el and not isinstance(el["tail"], str):
-            el["tail"] = _point(el["tail"], "tail")
+            el["tail"] = _point(el["tail"], "tail", bound)
         if kind == "path" and not isinstance(el.get("d"), str):
             raise BoardError("path needs 'd' (SVG path data)")
         if kind == "icon" and not el.get("name"):
