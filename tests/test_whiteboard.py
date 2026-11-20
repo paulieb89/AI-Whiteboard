@@ -921,15 +921,64 @@ def test_saved_boards_still_load_and_undo(board_server):
     assert hub.state.elements == {}
 
 
-def test_snapshot_timeout_must_fit(board_server):
+def test_snapshot_timeout_must_be_a_finite_number(board_server):
     url, hub = board_server
     hub.connect()  # a viewer that never answers
-    for value in ("1e20", "0", "-1", "601"):
+    for value in ("nan", "inf", "-inf", "soon"):
         status, res = call(url, f"/api/snapshot?timeout={value}")
         assert status == 400, value
         assert "timeout" in res["error"] and "viewer" not in res["error"]
-        assert value not in ("1e20", "-1", "601") or value not in res["error"]
         assert hub.snapshots == {}
+    for value in ("0", "-1"):  # as on main: no time to answer, so the viewer did not answer in time
+        status, res = call(url, f"/api/snapshot?timeout={value}")
+        assert status == 503, value
+        assert "in time" in res["error"]
+        assert hub.snapshots == {}
+
+
+def _prompt_viewer(url, reader, png):
+    def answer():
+        ev = reader.wait_for("snapshot")
+        data = "data:image/png;base64," + base64.b64encode(png).decode()
+        call(url, "/api/snapshot", {"req": ev["req"], "data": data})
+
+    threading.Thread(target=answer, daemon=True).start()
+
+
+@pytest.mark.parametrize("value", ["601", "1e20"])
+def test_a_long_snapshot_timeout_is_allowed(board_server, value):
+    url, hub = board_server
+    reader = EventReader(url)
+    png = b"\x89PNG\r\n\x1a\nfake"
+    try:
+        reader.wait_for("hello")
+        _prompt_viewer(url, reader, png)
+        status, body = call(url, f"/api/snapshot?timeout={value}")
+        assert status == 200 and body == png
+        assert hub.snapshots == {}
+    finally:
+        reader.close(hub)
+
+
+def test_a_huge_snapshot_timeout_does_not_overflow_the_wait(tmp_path):
+    from whiteboard.server import Hub
+
+    hub = Hub(tmp_path, persist=False)
+    hub.connect()
+    png = b"\x89PNG\r\n\x1a\nfake"
+    waits = []
+
+    def answering_wait(timeout=None):
+        waits.append(timeout)
+        threading.Lock().acquire(timeout=timeout)  # free lock: returns at once, but overflows like a real wait
+        rid = next(iter(hub.snapshots))
+        hub.snapshots[rid] = png
+        return True
+
+    hub.cond.wait = answering_wait
+    assert hub.request_snapshot(timeout=1e20) == png
+    assert waits and all(w <= threading.TIMEOUT_MAX for w in waits)
+    assert hub.snapshots == {}
 
 
 def test_a_failed_snapshot_wait_is_not_left_pending(tmp_path, monkeypatch):
@@ -1101,3 +1150,41 @@ def test_huge_settings_numbers_are_out_of_range(board_server, value):
     assert status == 400 and res["ok"] is False
     assert "width" in res["error"] and "out of range" in res["error"]
     assert hub.state.settings["width"] == 1600 and hub.state.history == []
+
+
+@pytest.mark.parametrize("value", [10 ** 400, -(10 ** 400)], ids=["huge", "-huge"])
+def test_a_huge_pause_is_out_of_range(board_server, value):
+    url, hub = board_server
+    status, res = call(url, "/api/pause", {"seconds": value})
+    assert status == 400 and res["ok"] is False
+    assert "seconds" in res["error"] and "out of range" in res["error"]
+    status, res = call(url, "/api/pause", {"seconds": 2})
+    assert status == 200 and res == {"ok": True, "seconds": 2.0}
+
+
+def test_the_largest_drawable_image_saves_and_loads_again(board_server):
+    from whiteboard.state import MAX_ELEMENT_BYTES
+
+    url, hub = board_server
+    prefix = "data:image/png;base64,"
+
+    def image(n):
+        return {"type": "image", "id": "large-image", "x": 0, "y": 0, "w": 100, "h": 100,
+                "src": prefix + "A" * n}
+
+    base = len(json.dumps(BoardState().normalize(image(0), set()), ensure_ascii=False))
+    largest = image(MAX_ELEMENT_BYTES - base)
+    assert len(json.dumps(BoardState().normalize(largest, set()), ensure_ascii=False)) == MAX_ELEMENT_BYTES
+    too_big = image(MAX_ELEMENT_BYTES - base + 1)
+    status, res = call(url, "/api/draw", {"elements": [too_big]})
+    assert status == 400 and "too large" in res["error"]
+
+    status, res = call(url, "/api/draw", {"elements": [largest]})
+    assert status == 200, res
+    drawn = hub.state.to_dict()["elements"]
+    assert call(url, "/api/save", {"name": "big"})[0] == 200
+    assert call(url, "/api/clear", {})[0] == 200
+    assert hub.state.elements == {}
+    status, res = call(url, "/api/load", {"name": "big"})
+    assert status == 200, res
+    assert hub.state.to_dict()["elements"] == drawn

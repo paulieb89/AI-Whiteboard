@@ -388,8 +388,11 @@ class BoardState:
             n += 1
         return f"{kind}{n}"
 
-    def normalize(self, raw: Any, taken: set, bound: float = MAX_COORD) -> Dict[str, Any]:
-        """Validate one element. `bound` caps every number; saved boards pass math.inf (finite only)."""
+    def normalize(self, raw: Any, taken: set, bound: float = MAX_COORD,
+                  limit_size: bool = True) -> Dict[str, Any]:
+        """Validate one element. `bound` caps every number; saved boards pass math.inf (finite only).
+        `limit_size` applies the drawn-element size cap; saved boards skip it, since the server adds
+        fields (author, ...) after the draw-time check and its own saves must load again."""
         if not isinstance(raw, dict):
             raise BoardError(f"each element must be a JSON object, got {type(raw).__name__}")
         el = dict(raw)
@@ -466,7 +469,7 @@ class BoardState:
             raise BoardError(f"duplicate id {eid!r} in the same request")
         el["id"] = eid
 
-        if len(json.dumps(el, ensure_ascii=False)) > MAX_ELEMENT_BYTES:
+        if limit_size and len(json.dumps(el, ensure_ascii=False)) > MAX_ELEMENT_BYTES:
             raise BoardError(f"element {eid!r} is too large")
         return el
 

@@ -45,7 +45,6 @@ OBJECT_ROUTES = {
     "/api/erase", "/api/choose", "/api/arrange", "/api/order", "/api/clear", "/api/settings",
     "/api/say", "/api/pause", "/api/point", "/api/save", "/api/load", "/api/layout", "/api/snapshot",
 }
-MAX_SNAPSHOT_TIMEOUT = 600.0  # seconds; far below threading.TIMEOUT_MAX on every platform
 CLIENT_GONE = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
 
 
@@ -171,9 +170,6 @@ class Hub:
 
     # ---- snapshots --------------------------------------------------------
     def request_snapshot(self, fmt: str = "png", width: int = 1600, timeout: float = 8.0) -> bytes:
-        # checked before the viewer check, and without the word "viewer": the HTTP layer maps those to 503
-        if not 0 < timeout <= MAX_SNAPSHOT_TIMEOUT:
-            raise BoardError(f"'timeout' must be more than 0 and at most {MAX_SNAPSHOT_TIMEOUT:g} seconds")
         if not self.viewers():
             raise BoardError("no viewer is open, so nothing can render the board. "
                              "Open the whiteboard in a browser first (open_whiteboard).")
@@ -188,7 +184,8 @@ class Hub:
                     left = deadline - time.time()
                     if left <= 0:
                         raise BoardError("the viewer did not answer the snapshot request in time")
-                    self.cond.wait(left)
+                    # a huge timeout is allowed, but a single wait longer than TIMEOUT_MAX overflows
+                    self.cond.wait(min(left, threading.TIMEOUT_MAX))
                 return self.snapshots[rid]
         finally:
             with self.cond:
@@ -380,6 +377,8 @@ class Hub:
             secs = max(0.0, min(float(seconds), 30.0))
         except (TypeError, ValueError):
             raise BoardError("pause needs a number of seconds") from None
+        except OverflowError:
+            raise BoardError("'seconds' is out of range") from None
         self.broadcast({"type": "pause", "seconds": secs})
         return {"ok": True, "seconds": secs}
 
@@ -489,9 +488,10 @@ class Hub:
             if not isinstance(raw.get("id"), str) or not raw["id"]:
                 raise BoardError(f"{where}: 'id' must be a non-empty string")
             try:
-                # the checks a drawn element gets, except the input range limit: the server's own
-                # relative placement can put an element past it, and such a board must load again
-                el = self.state.normalize(raw, taken, bound=math.inf)
+                # the checks a drawn element gets, except the input range and size limits: the
+                # server's own placement and added fields can put an element past them, and a
+                # board the server saved must load again
+                el = self.state.normalize(raw, taken, bound=math.inf, limit_size=False)
             except BoardError as exc:
                 raise BoardError(f"{where} ({raw['id']!r}): {exc}") from None
             taken.add(el["id"])
