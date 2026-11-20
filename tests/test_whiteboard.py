@@ -677,3 +677,184 @@ def test_bad_layout_report_does_not_break_the_board_api(board_server):
     [el] = board["elements"]
     assert el["id"] == "r" and el["bbox_estimated"] is True
     assert len(el["bbox"]) == 4 and el["bbox"][2] > 0 and el["bbox"][3] > 0
+
+
+# ---------------------------------------------------------------- bad input (issue #6)
+
+def post_raw(url, path, data):
+    req = urllib.request.Request(url + path, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}")
+
+
+def test_table_rows_must_be_a_list(board_server):
+    url, hub = board_server
+    status, res = call(url, "/api/draw", {"type": "table", "rows": 5})
+    assert status == 400 and res["ok"] is False and "rows" in res["error"]
+    assert hub.state.elements == {}
+
+    # empty and scalar rows keep working
+    status, res = call(url, "/api/draw", {"elements": [
+        {"type": "table", "id": "t", "rows": [["a", "b"], "c"]},
+        {"type": "table", "id": "e", "rows": []},
+    ]})
+    assert status == 200 and res["ok"]
+    status, res = call(url, "/api/update", {"id": "t", "changes": {"rows": "oops"}})
+    assert status == 400 and "rows" in res["error"]
+    assert hub.state.elements["t"]["rows"] == [["a", "b"], "c"]
+
+
+def test_erase_needs_an_object_body(board_server):
+    url, _ = board_server
+    status, res = call(url, "/api/erase", [1, 2])
+    assert status == 400 and res["ok"] is False
+    assert "object" in res["error"] and "array" in res["error"]
+    status, res = post_raw(url, "/api/erase", b"null")
+    assert status == 400 and "object" in res["error"]
+
+
+def test_object_routes_reject_other_json(board_server):
+    url, _ = board_server
+    for path in ("/api/settings", "/api/point", "/api/load", "/api/layout", "/api/clear", "/api/say"):
+        for body in ([1], "text", 3):
+            status, res = call(url, path, body)
+            assert status == 400 and res["ok"] is False and "object" in res["error"], (path, body)
+
+
+def test_erase_region_must_be_numbers(board_server):
+    url, _ = board_server
+    status, res = call(url, "/api/erase", {"region": ["a", 0, 1, 1]})
+    assert status == 400 and res["ok"] is False
+    assert "region[0]" in res["error"] and "number" in res["error"]
+    status, res = call(url, "/api/erase", {"ids": 5})
+    assert status == 400 and "ids" in res["error"]
+
+
+def test_point_coordinates_must_be_numbers(board_server):
+    url, _ = board_server
+    status, res = call(url, "/api/point", {"x": "abc", "y": 1})
+    assert status == 400 and res["ok"] is False
+    assert "'x'" in res["error"] and "number" in res["error"]
+    status, res = call(url, "/api/point", {"x": 10, "y": 20})
+    assert status == 200 and res["ok"]
+
+
+def test_snapshot_width_must_be_a_number(board_server):
+    url, hub = board_server
+    assert hub.viewers() == 0
+    status, res = call(url, "/api/snapshot?width=abc")
+    assert status == 400 and res["ok"] is False and "width" in res["error"]
+    status, res = call(url, "/api/snapshot?width=viewer&timeout=1")
+    assert status == 400 and "width" in res["error"]
+    status, res = call(url, "/api/snapshot?timeout=soon")
+    assert status == 400 and "timeout" in res["error"]
+    status, res = call(url, "/api/snapshot")  # valid parameters, no viewer
+    assert status == 503
+
+
+@pytest.mark.parametrize("content, expected", [
+    ("{not json", "not valid JSON"),
+    ("[1, 2, 3]", "expected a JSON object"),
+    ('{"elements": {"a": 1}}', "'elements' must be an array"),
+    ('{"settings": [1]}', "'settings' must be an object"),
+])
+def test_loading_a_corrupt_saved_board_is_explained(board_server, content, expected):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [{"type": "title", "id": "keep", "text": "Keep me"}]})
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "broken.json").write_text(content, encoding="utf-8")
+    before, history = hub.state.to_dict(), len(hub.state.history)
+
+    status, res = call(url, "/api/load", {"name": "broken"})
+    assert status == 400 and res["ok"] is False
+    assert "broken" in res["error"] and expected in res["error"]
+    assert hub.state.to_dict() == before
+    assert len(hub.state.history) == history
+
+
+def test_draw_and_update_still_take_arrays_and_objects(board_server):
+    url, hub = board_server
+    status, res = call(url, "/api/draw", [{"type": "rect", "id": "a", "x": 0, "y": 0, "w": 10, "h": 10}])
+    assert status == 200 and res["ok"]
+    status, res = call(url, "/api/draw", {"type": "rect", "id": "b", "x": 50, "y": 0, "w": 10, "h": 10})
+    assert status == 200 and res["ok"]
+    status, res = call(url, "/api/update", [{"id": "a", "changes": {"color": "red"}}])
+    assert status == 200 and hub.state.elements["a"]["color"] == "red"
+    status, res = call(url, "/api/update", {"id": "b", "color": "blue"})
+    assert status == 200 and hub.state.elements["b"]["color"] == "blue"
+    status, res = call(url, "/api/update", 7)
+    assert status == 400 and res["ok"] is False
+    status, res = call(url, "/api/undo", [])  # a route that ignores its body
+    assert status == 200
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("boom"), ValueError("boom"), TypeError("boom")])
+def test_unexpected_errors_are_logged_500s(board_server, monkeypatch, capsys, exc):
+    url, hub = board_server
+
+    def broken(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(hub, "undo", broken)
+    monkeypatch.setattr(hub, "saved", broken)
+    for path, body in (("/api/undo", {}), ("/api/saves", None)):
+        status, res = call(url, path, body)
+        assert status == 500, path
+        assert res["ok"] is False and res["error"]
+        assert type(exc).__name__ in res["error"]
+    err = capsys.readouterr().err
+    assert "Traceback" in err and "boom" in err
+    assert "/api/undo" in err and "/api/saves" in err
+    # the server keeps answering
+    assert call(url, "/api/health")[0] == 200
+
+
+def test_client_reports_http_errors_without_retrying(board_server, monkeypatch):
+    from whiteboard.client import Whiteboard, WhiteboardError
+
+    url, hub = board_server
+    calls = []
+    real_erase = hub.erase
+
+    def counting_erase(*args, **kwargs):
+        calls.append(args)
+        return real_erase(*args, **kwargs)
+
+    monkeypatch.setattr(hub, "erase", counting_erase)
+    wb = Whiteboard(url, autostart=False, open_browser=False)
+    with pytest.raises(WhiteboardError, match=r"region\[0\]"):
+        wb.erase(region=["a", 0, 1, 1])
+    assert len(calls) == 1
+
+    def broken_undo():
+        calls.append("undo")
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(hub, "undo", broken_undo)
+    with pytest.raises(WhiteboardError, match="internal server error"):
+        wb.undo()
+    assert calls.count("undo") == 1
+
+
+def test_client_still_retries_a_lost_connection(board_server, monkeypatch):
+    from whiteboard.client import Whiteboard
+
+    url, _ = board_server
+    wb = Whiteboard(url, autostart=False, open_browser=False)
+    real_request = wb._request
+    seen = []
+
+    def flaky(method, path, body=None, **kw):
+        if path != "/api/health":
+            seen.append(path)
+            if len(seen) == 1:
+                raise ConnectionError("server went away")
+        return real_request(method, path, body, **kw)
+
+    monkeypatch.setattr(wb, "_request", flaky)
+    assert wb.undo()["ok"] is False  # nothing to undo, but it answered
+    assert seen == ["/api/undo", "/api/undo"]

@@ -427,6 +427,9 @@ class BoardState:
                     el[end] = {"id": str(v["id"]), **{k: v[k] for k in ("side",) if k in v}}
                 else:
                     el[end] = _point(v, end)
+        if kind == "table" and el.get("rows") is not None and not isinstance(el["rows"], list):
+            raise BoardError(f"table 'rows' must be a list of rows (each a list of cells), "
+                             f"got {type(el['rows']).__name__}")
         if kind == "bubble" and "tail" in el and not isinstance(el["tail"], str):
             el["tail"] = _point(el["tail"], "tail")
         if kind == "path" and not isinstance(el.get("d"), str):
