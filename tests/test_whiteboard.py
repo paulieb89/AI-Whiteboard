@@ -792,7 +792,9 @@ def test_draw_and_update_still_take_arrays_and_objects(board_server):
     assert status == 200
 
 
-@pytest.mark.parametrize("exc", [RuntimeError("boom"), ValueError("boom"), TypeError("boom")])
+@pytest.mark.parametrize("exc", [RuntimeError("boom"), ValueError("boom"), TypeError("boom"),
+                                 ConnectionResetError("boom"), BrokenPipeError("boom"),
+                                 ConnectionAbortedError("boom")])
 def test_unexpected_errors_are_logged_500s(board_server, monkeypatch, capsys, exc):
     url, hub = board_server
 
@@ -858,3 +860,92 @@ def test_client_still_retries_a_lost_connection(board_server, monkeypatch):
     monkeypatch.setattr(wb, "_request", flaky)
     assert wb.undo()["ok"] is False  # nothing to undo, but it answered
     assert seen == ["/api/undo", "/api/undo"]
+
+
+@pytest.mark.parametrize("element, expected", [
+    ({"type": "table", "id": "t", "rows": 5}, "rows"),
+    ({"type": "rect", "id": ["a"], "x": 0, "y": 0, "w": 10, "h": 10}, "'id' must be a non-empty string"),
+    ({"type": "rect", "x": 0, "y": 0, "w": 10, "h": 10}, "'id' must be a non-empty string"),
+    ({"type": "rect", "id": "r", "x": "left", "y": 0, "w": 10, "h": 10}, "'x'"),
+    ({"type": "nonsense", "id": "n"}, "unknown element type"),
+    ("just text", "expected an object"),
+])
+def test_loading_a_saved_board_with_bad_elements_is_explained(board_server, element, expected):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [{"type": "title", "id": "keep", "text": "Keep me"}]})
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    good = {"type": "rect", "id": "ok", "x": 0, "y": 0, "w": 10, "h": 10}
+    (folder / "broken.json").write_text(json.dumps({"elements": [good, element]}), encoding="utf-8")
+    before, history = hub.state.to_dict(), len(hub.state.history)
+
+    status, res = call(url, "/api/load", {"name": "broken"})
+    assert status == 400 and res["ok"] is False
+    assert "broken" in res["error"] and "index 1" in res["error"] and expected in res["error"]
+    assert hub.state.to_dict() == before
+    assert len(hub.state.history) == history
+    status, res = call(url, "/api/board")
+    assert status == 200 and [e["id"] for e in res["elements"]] == ["keep"]
+
+
+def test_loading_a_saved_board_with_bad_settings_is_explained(board_server):
+    url, hub = board_server
+    folder = hub.data_dir / "saved"
+    folder.mkdir(parents=True, exist_ok=True)
+    for settings, expected in (({"width": "wide"}, "width"), ({"height": 10}, "height"),
+                               ({"background": "lava"}, "background")):
+        (folder / "broken.json").write_text(json.dumps({"settings": settings}), encoding="utf-8")
+        before = hub.state.to_dict()
+        status, res = call(url, "/api/load", {"name": "broken"})
+        assert status == 400 and expected in res["error"], settings
+        assert hub.state.to_dict() == before and hub.state.history == []
+
+
+def test_saved_boards_still_load_and_undo(board_server):
+    url, hub = board_server
+    call(url, "/api/draw", {"elements": [
+        {"type": "table", "id": "t", "x": 10, "y": 10, "rows": [["a", "b"], ["c", "d"]]},
+        {"type": "arrow", "id": "ar", "from": [0, 0], "to": {"id": "t", "side": "left"}},
+        {"type": "button", "id": "b", "text": "Go", "x": 300, "y": 300},
+    ]})
+    call(url, "/api/settings", {"background": "grid", "width": 2000})
+    assert call(url, "/api/save", {"name": "demo"})[0] == 200
+    saved = hub.state.to_dict()
+    call(url, "/api/clear", {})
+    status, res = call(url, "/api/load", {"name": "demo"})
+    assert status == 200 and res["count"] == 3
+    assert hub.state.to_dict()["elements"] == saved["elements"]
+    assert hub.state.settings["background"] == "grid" and hub.state.settings["width"] == 2000
+    assert call(url, "/api/board")[0] == 200
+    assert call(url, "/api/undo", {})[1]["ok"] is True
+    assert hub.state.elements == {}
+
+
+def test_snapshot_timeout_must_fit(board_server):
+    url, hub = board_server
+    hub.connect()  # a viewer that never answers
+    for value in ("1e20", "0", "-1", "601"):
+        status, res = call(url, f"/api/snapshot?timeout={value}")
+        assert status == 400, value
+        assert "timeout" in res["error"] and "viewer" not in res["error"]
+        assert value not in ("1e20", "-1", "601") or value not in res["error"]
+        assert hub.snapshots == {}
+
+
+def test_a_failed_snapshot_wait_is_not_left_pending(tmp_path, monkeypatch):
+    from whiteboard.server import Hub
+
+    hub = Hub(tmp_path, persist=False)
+    hub.connect()
+
+    def broken_wait(timeout=None):
+        raise RuntimeError("wait failed")
+
+    monkeypatch.setattr(hub.cond, "wait", broken_wait)
+    with pytest.raises(RuntimeError):
+        hub.request_snapshot(timeout=1)
+    assert hub.snapshots == {}
+    monkeypatch.undo()
+    with pytest.raises(BoardError, match="in time"):
+        hub.request_snapshot(timeout=0.05)
+    assert hub.snapshots == {}
